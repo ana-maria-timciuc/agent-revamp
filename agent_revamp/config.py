@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-5", alias="OPENAI_MODEL")
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
+    embedding_model: str = Field(
+        default="text-embedding-3-small", alias="EMBEDDING_MODEL"
+    )
 
     penny_mcp_url: str = Field(
         default="http://localhost:8011/mcp/", alias="PENNY_MCP_URL"
@@ -21,7 +24,22 @@ class Settings(BaseSettings):
     max_tool_iterations: int = Field(default=12, alias="MAX_TOOL_ITERATIONS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # ── RAG / intent preprocessing ─────────────────────────────────────────
+    qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
+    skills_collection: str = Field(default="skills", alias="QDRANT_SKILLS_COLLECTION")
+    tools_collection: str = Field(default="tools", alias="QDRANT_TOOLS_COLLECTION")
+    intent_taxonomy: str = Field(
+        default=DEFAULT_INTENT_TAXONOMY, alias="INTENT_TAXONOMY"
+    )
+    retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K")
+    skills_dirs: str = Field(default="", alias="SKILLS_DIRS")
+    # Comma-separated agent_type=/path/to/skills pairs, e.g.
+    # "penny=../realbooks-agents/agents/penny/skills,dollar_bill=../realbooks-agents/agents/dollar_bill/skills,"
+    # "uncle_sam=../realbooks-agents/agents/uncle_sam/skills". Empty falls back to defaults below.
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     def get_openai_base_url(self) -> str | None:
         return (
