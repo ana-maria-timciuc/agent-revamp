@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Environment files (keep the example template)
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
