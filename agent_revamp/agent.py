@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from agent_revamp.config import settings
 from agent_revamp.mcp_tools import call_tool_safe
 from agent_revamp.preprocess.leak_guard import sanitize_user_text
+from agent_revamp.preprocess.process_class import ProcessClass, ToolScopeError, filter_tools, validate_tool_scope
 from agent_revamp.preprocess.result_sanitizer import sanitize_tool_result
 from agent_revamp.preprocess.schema_mapper import build_schema_prompt
 from agent_revamp.preprocess.sql_translator import SQLTranslationError, translate_sql
@@ -52,10 +53,16 @@ class Agent:
         max_iterations: int | None = None,
         session_id: str | None = None,
         state_dir: str | None = None,
+        process_class: ProcessClass | None = None,
     ):
         self.mcp_url = mcp_url or settings.penny_mcp_url
         self.model = model or settings.openai_model
         self.max_iterations = max_iterations or settings.max_tool_iterations
+        # TODO(intent-classifier): process_class is fixed at construction time (config/caller-
+        # supplied) rather than classified from the incoming message. The target architecture
+        # has a dedicated Intent classifier stage upstream of Agent to make that call
+        # dynamically per message — not built yet.
+        self.process_class: ProcessClass = process_class or settings.process_class
         self.system_prompt = system_prompt
         self.session_id = session_id or _new_session_id()
         self.store = SessionStore(state_dir or settings.state_dir)
@@ -77,6 +84,9 @@ class Agent:
         self._mcp = MCPClient(self.mcp_url)
         await self._mcp.__aenter__()
         mcp_tools = await self._mcp.list_tools()
+        # Hard-remove any tool this process class isn't allowed to use at all, before it's
+        # ever sanitized, indexed into Qdrant, or shown to the model.
+        mcp_tools = filter_tools(mcp_tools, self.process_class)
         self._openai_tools = [sanitize_tool_schema(tool) for tool in mcp_tools]
         self._tool_schemas = {t["function"]["name"]: t for t in self._openai_tools}
 
@@ -194,6 +204,18 @@ class Agent:
             tools = self._openai_tools
         if skills:
             logger.info("Retrieved %d skill(s) for the turn", len(skills))
+
+        # Second, independent check (filter_tools in __aenter__ is the first): assert every
+        # tool about to be shown to the model this turn is within this process class's
+        # allowlist. Guards specifically against Qdrant-based retrieval ever surfacing
+        # something out of scope (e.g. a shared collection carrying entries from a session
+        # run under a different process class) — see preprocess/process_class.py.
+        try:
+            validate_tool_scope([t["function"]["name"] for t in tools], self.process_class)
+        except ToolScopeError as exc:
+            logger.error("Tool-scope validation failed, refusing turn: %s", exc)
+            self._persist()
+            return "Internal error: this request was blocked by a tool-scope safety check."
 
         for _ in range(self.max_iterations):
             kwargs: dict = {

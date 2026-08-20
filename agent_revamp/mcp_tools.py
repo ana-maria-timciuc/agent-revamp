@@ -6,8 +6,11 @@ Tool-schema sanitization now lives in agent_revamp/preprocess/tool_sanitizer.py,
 model must only ever see friendly (non-real) tool schemas — see that module.
 """
 
+import asyncio
 import json
 from typing import Any
+
+from agent_revamp.config import settings
 
 
 def extract_content(result: Any) -> str:
@@ -33,10 +36,17 @@ def extract_content(result: Any) -> str:
 
 
 async def call_tool_safe(mcp_client: Any, name: str, arguments: dict[str, Any]) -> str:
-    """Call an MCP tool, normalizing any failure into a JSON error string rather than
-    raising — keeps one bad tool call from killing the whole agent loop iteration."""
+    """Call an MCP tool, normalizing any failure (including a timeout) into a JSON error
+    string rather than raising — keeps one bad or hung tool call from blocking the whole
+    agent loop indefinitely."""
     try:
-        result = await mcp_client.call_tool(name, arguments)
+        result = await asyncio.wait_for(
+            mcp_client.call_tool(name, arguments), timeout=settings.tool_call_timeout_seconds
+        )
         return extract_content(result)
+    except TimeoutError:
+        return json.dumps(
+            {"error": f"Tool call to {name} timed out after {settings.tool_call_timeout_seconds}s."}
+        )
     except Exception as exc:
         return json.dumps({"error": str(exc)})

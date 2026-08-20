@@ -1,6 +1,8 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_revamp.preprocess.process_class import ProcessClass
+
 _PROVIDER_BASE_URLS: dict[str, str] = {
     "openai": "",
     "deepseek": "https://api.deepseek.com",
@@ -15,7 +17,9 @@ class Settings(BaseSettings):
 
     penny_mcp_url: str = Field(default="http://localhost:8011/mcp/", alias="PENNY_MCP_URL")
     default_account_id: int = Field(default=1, alias="DEFAULT_ACCOUNT_ID")
+    process_class: ProcessClass = Field(default="penny", alias="PROCESS_CLASS")
     max_tool_iterations: int = Field(default=12, alias="MAX_TOOL_ITERATIONS")
+    tool_call_timeout_seconds: float = Field(default=45.0, alias="TOOL_CALL_TIMEOUT_SECONDS")
     state_dir: str = Field(default="state/", alias="STATE_DIR")
     max_history_messages: int = Field(default=12, alias="MAX_HISTORY_MESSAGES")
     max_message_chars: int = Field(default=3000, alias="MAX_MESSAGE_CHARS")
