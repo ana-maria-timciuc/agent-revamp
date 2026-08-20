@@ -1,29 +1,13 @@
-"""MCP tool-schema conversion and result extraction — ported (trimmed) from realbooks-agents.
+"""MCP result extraction — ported (trimmed) from realbooks-agents.
 
 - extract_content(): app/agent/mcp_bridge.py::_extract_content, verbatim.
-- tools_to_openai_schema(): the plain conversion shape used in
-  app/agent/tool_schema_sanitizer.py::sanitize_tool_schema, WITHOUT the schema_map.json-driven
-  friendly-rename layer (platform-specific, not applicable here — no schema_map.json exists
-  in this project, so tool schemas pass through with their real MCP names/params as-is).
+
+Tool-schema sanitization now lives in agent_revamp/preprocess/tool_sanitizer.py, since the
+model must only ever see friendly (non-real) tool schemas — see that module.
 """
 
 import json
 from typing import Any
-
-
-def tools_to_openai_schema(mcp_tools: list[Any]) -> list[dict[str, Any]]:
-    """Convert MCP Tool objects (from Client.list_tools()) to OpenAI function-tool dicts."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema,
-            },
-        }
-        for tool in mcp_tools
-    ]
 
 
 def extract_content(result: Any) -> str:
