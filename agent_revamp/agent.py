@@ -10,9 +10,10 @@ from openai import AsyncOpenAI
 
 from agent_revamp.config import settings
 from agent_revamp.mcp_tools import call_tool_safe
+from agent_revamp.preprocess.leak_guard import sanitize_user_text
 from agent_revamp.preprocess.result_sanitizer import sanitize_tool_result
 from agent_revamp.preprocess.schema_mapper import build_schema_prompt
-from agent_revamp.preprocess.sql_translator import translate_sql
+from agent_revamp.preprocess.sql_translator import SQLTranslationError, translate_sql
 from agent_revamp.preprocess.tool_sanitizer import inject_account_id, sanitize_tool_schema, translate_tool_args
 from agent_revamp.state import SessionStore
 from agent_revamp.vector import Embedder, SkillIndex, ToolIndex
@@ -207,11 +208,18 @@ class Agent:
 
             response = await client.chat.completions.create(**kwargs)
             message = response.choices[0].message
-            self.messages.append(message.model_dump(exclude_none=True))
+            message_dict = message.model_dump(exclude_none=True)
+            # Last line of defense: strip anything that slipped through the preprocess layer
+            # (a hallucinated real name, a recited friendly label, pasted SQL) before this text
+            # is shown to the user OR persisted — persisted history is replayed as context on
+            # every future turn, so an unsanitized leak here would resurface indefinitely.
+            if isinstance(message_dict.get("content"), str):
+                message_dict["content"] = sanitize_user_text(message_dict["content"])
+            self.messages.append(message_dict)
 
             if not message.tool_calls:
                 self._persist()
-                return message.content or ""
+                return message_dict.get("content") or ""
 
             results = await asyncio.gather(*(self._dispatch(tc) for tc in message.tool_calls))
             for tool_call_id, content in results:
@@ -230,7 +238,10 @@ class Agent:
         args = translate_tool_args(name, args)
         args = inject_account_id(name, args)
         if name in _SQL_TOOLS and "sql" in args:
-            args["sql"] = translate_sql(args["sql"], account_id=args["account_id"])
+            try:
+                args["sql"] = translate_sql(args["sql"], account_id=args["account_id"])
+            except SQLTranslationError as exc:
+                return tool_call.id, json.dumps({"error": str(exc)})
 
         content = await call_tool_safe(self._mcp, name, args)
         content = sanitize_tool_result(content, name)

@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 _SCHEMA_MAP_PATH = Path(__file__).parent / "schema_map.json"
 
 
+class SQLTranslationError(Exception):
+    """Raised when the model's SQL can't be safely translated to the real schema —
+    unparseable, not a SELECT, or referencing a table/column outside the data catalog.
+    Callers must treat this as a rejected query, never fall back to the untranslated SQL."""
+
+
 def _load_map() -> dict[str, Any]:
     with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
         return json.load(fh)
@@ -75,6 +81,7 @@ def _translate_table(
     lookups: dict[str, Any],
     referenced: set[str],
     alias_map: dict[str, str],
+    unresolved: set[str],
 ) -> None:
     if not _token_is_identifier(node.this):
         return
@@ -86,6 +93,7 @@ def _translate_table(
 
     config = lookups["friendly_table_config"].get(fkey) or lookups["friendly_table_config"].get(friendly)
     if config is None:
+        unresolved.add(friendly)
         return
 
     real_name = config["real_name"]
@@ -100,7 +108,7 @@ def _translate_column(
     node: exp.Column,
     lookups: dict[str, Any],
     alias_map: dict[str, str],
-    _referenced_tables: set[str],
+    unresolved: set[str],
 ) -> None:
     if not _token_is_identifier(node.this):
         return
@@ -111,6 +119,7 @@ def _translate_column(
     col_key = col_friendly.lower()
 
     table_friendly = None
+    table_qualifier_display: str | None = None
 
     if node.table:
         tbl_name = None
@@ -121,6 +130,7 @@ def _translate_column(
             if isinstance(inner, str):
                 tbl_name = inner
         if tbl_name:
+            table_qualifier_display = tbl_name
             tbl_key = tbl_name.lower()
             config = lookups["friendly_table_config"].get(tbl_key) or lookups["friendly_table_config"].get(tbl_name)
             if config:
@@ -153,6 +163,9 @@ def _translate_column(
         # Remember the friendly name so the SELECT pass can re-alias the column: the DB
         # returns real column names as result keys, which must not reach the LLM.
         node.meta["friendly_name"] = col_friendly
+    else:
+        label = f"{table_qualifier_display}.{col_friendly}" if table_qualifier_display else col_friendly
+        unresolved.add(label)
 
 
 def _alias_selected_columns(tree: exp.Expression) -> None:
@@ -207,17 +220,26 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
     try:
         tree = sqlglot.parse_one(friendly_sql, dialect="mysql")
     except Exception as exc:
-        logger.warning("sqlglot parse failed, returning original SQL: %s", exc)
-        return friendly_sql
+        raise SQLTranslationError(f"Could not parse SQL: {exc}") from exc
+
+    if not isinstance(tree, exp.Select | exp.Union):
+        raise SQLTranslationError("Only SELECT queries are allowed.")
 
     alias_map: dict[str, str] = {}
     referenced_tables: set[str] = set()
+    unresolved: set[str] = set()
 
     for table_node in tree.find_all(exp.Table):
-        _translate_table(table_node, lookups, referenced_tables, alias_map)
+        _translate_table(table_node, lookups, referenced_tables, alias_map, unresolved)
 
     for col_node in tree.find_all(exp.Column):
-        _translate_column(col_node, lookups, alias_map, referenced_tables)
+        _translate_column(col_node, lookups, alias_map, unresolved)
+
+    if unresolved:
+        raise SQLTranslationError(
+            "Unknown table/column in your query: " + ", ".join(sorted(unresolved))
+            + ". Only use names from the data catalog."
+        )
 
     _alias_selected_columns(tree)
     _add_mandatory_where(tree, lookups, alias_map, account_id)

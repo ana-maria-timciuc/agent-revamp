@@ -30,6 +30,21 @@ _FUNC_WRAP_RE = re.compile(r"^[A-Z_]+\((.*)\)$")
 
 _BUILTIN_PASS_THROUGH_KEYS: set[str] = {"error", "info"}
 
+# Non-printable/control characters (keeping \n and \t) and a length cap applied to every
+# free-text value (Vendor, Description, ...) returned from the database before it re-enters
+# the model's context — a defense-in-depth bound against instructions smuggled into
+# user-entered data (prompt injection via tool output). This is independent of, and doesn't
+# rely on, the model correctly treating tool output as data rather than instructions.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MAX_STRING_LEN = 500
+
+
+def _sanitize_string(value: str) -> str:
+    cleaned = _CONTROL_CHAR_RE.sub("", value)
+    if len(cleaned) > _MAX_STRING_LEN:
+        cleaned = cleaned[:_MAX_STRING_LEN] + "...[truncated]"
+    return cleaned
+
 
 def _load_map() -> dict[str, Any]:
     with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
@@ -98,6 +113,8 @@ def _sanitize_object(
         lower_key = key.lower()
         if lower_key in hidden:
             continue
+        if isinstance(value, str):
+            value = _sanitize_string(value)
         if lower_key in keep_keys or key in keep_keys:
             result[key] = value
             continue
