@@ -1,0 +1,191 @@
+{
+  "_comment": "Friendly-to-real name mapping for penny-mcp's schema. The LLM sees/writes ONLY friendly names; sql_translator.py swaps them before SQL execution; result_sanitizer.py uses the reverse mapping to hide real names from LLM-visible data. Built from E:\\realbooks\\realbooks-penny-mcp\\app\\resources\\schema.py's real schema (six tables), reusing realbooks-agents' friendly vocabulary where the underlying column matches.",
+
+  "tables": {
+    "Transactions": {
+      "real_name": "transaction",
+      "backtick": true,
+      "description": "Financial transactions — income, expenses, refunds, and loan payments",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "Amount": "amount",
+        "Date": "date",
+        "Type": "flow_type",
+        "Category": "sub_category_id",
+        "CategoryGroup": "flow_category",
+        "Description": "description",
+        "Vendor": "vendor",
+        "PropertyId": "asset_id",
+        "EntityId": "entity_id",
+        "ProjectId": "project_id",
+        "LoanId": "loan_id",
+        "PrincipalPaid": "principle_payment",
+        "InterestPaid": "interest_payment",
+        "EscrowPaid": "escrow_payment",
+        "PMIPaid": "pmi_payment",
+        "LateFees": "fees_late_charges"
+      },
+      "hidden_columns": ["uid", "account_id", "delete_timestamp", "is_archived", "split_transactions_id"],
+      "mandatory_where": [
+        "{alias}.account_id = {account_id}",
+        "{alias}.delete_timestamp IS NULL",
+        "COALESCE({alias}.is_archived, 0) = 0",
+        "{alias}.split_transactions_id IS NULL"
+      ]
+    },
+
+    "Properties": {
+      "real_name": "asset",
+      "backtick": false,
+      "description": "Properties the user owns or manages",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "PropertyName": "display_name",
+        "EntityId": "entity_id",
+        "Address": "address_1",
+        "City": "city",
+        "State": "state",
+        "Zip": "zip",
+        "PurchasePrice": "purchase_price",
+        "PurchaseDate": "purchase_date",
+        "ARV": "arv",
+        "PropertyType": "asset_type",
+        "PropertySubType": "property_type"
+      },
+      "hidden_columns": ["uid", "account_id", "delete_timestamp", "is_archived"],
+      "mandatory_where": [
+        "{alias}.account_id = {account_id}",
+        "{alias}.delete_timestamp IS NULL",
+        "COALESCE({alias}.is_archived, 0) = 0"
+      ]
+    },
+
+    "Entities": {
+      "real_name": "entities",
+      "backtick": false,
+      "description": "Legal entities (LLCs, S-Corps, etc.)",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "EntityName": "name",
+        "LegalType": "entity_type",
+        "PortfolioType": "portfolio_type",
+        "Status": "status",
+        "Address": "address_1",
+        "City": "city",
+        "State": "state",
+        "Zip": "zip"
+      },
+      "hidden_columns": ["uid", "account_id", "delete_timestamp", "is_archived"],
+      "mandatory_where": [
+        "{alias}.account_id = {account_id}",
+        "{alias}.delete_timestamp IS NULL",
+        "COALESCE({alias}.is_archived, 0) = 0"
+      ]
+    },
+
+    "Loans": {
+      "real_name": "loan",
+      "backtick": false,
+      "description": "Mortgages and loans linked to properties",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "Lender": "lender",
+        "LoanNumber": "loan_number",
+        "LoanPosition": "loan_position",
+        "LoanType": "loan_type",
+        "LoanTerm": "loan_term",
+        "Rate": "loan_rate",
+        "PrincipalAmount": "principle_amount",
+        "PaymentAmount": "payment_amount",
+        "OriginationDate": "origination_date",
+        "PropertyId": "asset_id"
+      },
+      "hidden_columns": ["uid", "account_id", "delete_timestamp", "is_archived"],
+      "mandatory_where": [
+        "{alias}.account_id = {account_id}",
+        "{alias}.delete_timestamp IS NULL",
+        "COALESCE({alias}.is_archived, 0) = 0"
+      ]
+    },
+
+    "Projects": {
+      "real_name": "project",
+      "backtick": false,
+      "description": "Renovation projects and rooms linked to properties. Main projects have no ParentProjectId; rooms/sub-projects have ParentProjectId set to their parent's Id.",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "ProjectName": "project_name",
+        "Budget": "project_budget_total",
+        "PropertyId": "asset_id",
+        "ParentProjectId": "project_id"
+      },
+      "hidden_columns": ["uid", "account_id", "delete_timestamp", "is_archived"],
+      "mandatory_where": [
+        "{alias}.account_id = {account_id}",
+        "{alias}.delete_timestamp IS NULL",
+        "COALESCE({alias}.is_archived, 0) = 0"
+      ]
+    },
+
+    "CategoryLookup": {
+      "real_name": "statuses_types",
+      "backtick": false,
+      "description": "Maps category IDs to human-readable category names (e.g. Rent, Insurance, Loan Payment)",
+      "pk_column": "Id",
+      "pk_real": "uid",
+      "columns": {
+        "CategoryName": "name",
+        "CategoryType": "type",
+        "EntityModel": "entity_model"
+      },
+      "hidden_columns": ["uid"],
+      "mandatory_where": []
+    }
+  },
+
+  "joins": {
+    "Transactions→Properties": { "from": "Transactions.PropertyId", "to": "Properties.Id", "type": "JOIN" },
+    "Transactions→Entities": { "from": "Transactions.EntityId", "to": "Entities.Id", "type": "JOIN" },
+    "Transactions→Loans": { "from": "Transactions.LoanId", "to": "Loans.Id", "type": "JOIN" },
+    "Transactions→Projects": { "from": "Transactions.ProjectId", "to": "Projects.Id", "type": "JOIN" },
+    "Transactions→CategoryLookup": { "from": "Transactions.Category", "to": "CategoryLookup.Id", "type": "JOIN" },
+    "Properties→Entities": { "from": "Properties.EntityId", "to": "Entities.Id", "type": "JOIN" },
+    "Loans→Properties": { "from": "Loans.PropertyId", "to": "Properties.Id", "type": "JOIN" },
+    "Projects→Properties": { "from": "Projects.PropertyId", "to": "Properties.Id", "type": "JOIN" },
+    "Projects→Projects (rooms)": { "from": "Projects.ParentProjectId", "to": "Projects.Id", "type": "JOIN" }
+  },
+
+  "sql_rules": {
+    "money": "Income uses income-type amounts, expenses use expense-type amounts. Net is income minus expenses. Refunds are tracked separately.",
+    "split_transactions": "Split-child rows are automatically excluded by mandatory filters — you never need to filter for this yourself.",
+    "loan_payment_breakdown": "Loan payments have LoanId set. Use PrincipalPaid, InterestPaid, EscrowPaid, PMIPaid, LateFees for breakdowns only. For totals, use Amount.",
+    "projects_vs_rooms": "Projects with no ParentProjectId are main projects; rows with ParentProjectId set are rooms/sub-projects of that project."
+  },
+
+  "tool_hidden_args": {
+    "execute_query": ["account_id"],
+    "generate_report": ["account_id"]
+  },
+
+  "tool_description_rewrites": {
+    "execute_query": "Execute a read-only SQL query against the RealBooks database and return up to 200 rows as JSON. Use this for ad-hoc or cross-resource data listings: properties, entities, transactions, projects, loans, or any combination.\nWrite your SQL using ONLY the friendly table/column names from the data catalog in your system prompt — the translator converts them to the database names automatically before execution and adds the mandatory filters (account scoping, soft-delete, archive, split-transaction) for you. You never write those filters yourself, and you never pass an account id — it is applied automatically.\nSELECT only — INSERT, UPDATE, DELETE, DROP, and TRUNCATE are rejected.",
+    "generate_report": "Generate a visual financial report from a SELECT query and return it to the user. The chart renders automatically on the frontend — never add links, URLs, or image tags.\nviz_type (default 'auto' picks for you): 'line' for time series/monthly trends, 'bar' for comparisons across properties/entities or income-vs-expense, 'pie' for a category breakdown of <=8 groups, 'scalar' for a single total/KPI. Never use 'table' — always aggregate and chart.\nWrite your SQL using ONLY the friendly table/column names from the data catalog in your system prompt — the translator converts them to the database names automatically before execution and adds the mandatory filters (account scoping, soft-delete, archive, split-transaction) for you. You never pass an account id — it is applied automatically.\nReturns {\"status\": \"no_data\"} when the query matches 0 rows — when you see this, tell the user in plain text (e.g. 'No expenses found for that property') and do NOT retry. You never need to run a separate COUNT first; this tool detects empty results for you."
+  },
+
+  "result_tools": {
+    "execute_query": {
+      "type": "list",
+      "root_key": "rows"
+    },
+    "generate_report": {
+      "type": "report",
+      "data_key": "data_preview",
+      "keep_keys": ["token", "question_id", "has_account_id_param", "status", "viz_type", "row_count"]
+    }
+  }
+}

@@ -224,3 +224,6 @@ __marimo__/
 
 # IDE
 .idea/
+
+# Runtime session state
+state/
