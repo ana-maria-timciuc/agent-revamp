@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,36 @@ from agent_revamp.core.state import SessionStore
 from agent_revamp.core.vector import Embedder, SkillIndex, ToolIndex
 
 _SQL_TOOLS = {"execute_query", "generate_report"}
+
+_REPORT_KEEP_KEYS = (
+    "token",
+    "question_id",
+    "figure_json",
+    "has_account_id_param",
+    "status",
+    "viz_type",
+    "row_count",
+    "data_preview",
+)
+
+
+def _extract_report_payload(content: str, title: str | None) -> dict:
+    """Capture the user-facing fields of a sanitized generate_report result.
+
+    Mirrors the original harness's report handling (harness.py::_REPORT_TOOLS branch):
+    the metabase token/question_id/etc. are relayed to the caller as-is; the sanitizer
+    already stripped everything else, so this is safe to surface.
+    """
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    payload = {k: parsed.get(k) for k in _REPORT_KEEP_KEYS if parsed.get(k) is not None}
+    if title:
+        payload["title"] = title
+    return payload
 
 logger = logging.getLogger(__name__)
 

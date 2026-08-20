@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     skills_dir: str = Field(default="skills/", alias="SKILLS_DIR")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # Auth into /agent/* (mirrors realbooks-agents): the Cognito Bearer token is verified
+    # via JWKS and account_id/permissions/role_key are derived from the users SAPI — never
+    # from the request body. Same env names as the original service, so the same credentials
+    # work unchanged.
+    cognito_jwks_url: str = Field(default="", alias="COGNITO_JWKS_URL")
+    users_domain: str = Field(default="", alias="USERS_DOMAIN")
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     def get_openai_base_url(self) -> str | None:
