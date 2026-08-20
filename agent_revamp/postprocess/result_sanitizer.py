@@ -22,7 +22,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-_SCHEMA_MAP_PATH = Path(__file__).parent / "schema_map.json"
+_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
 
 # Unwraps function-wrapped result keys like "SUM(amount)" so the inner real column name can
 # be renamed ("SUM(Amount)").

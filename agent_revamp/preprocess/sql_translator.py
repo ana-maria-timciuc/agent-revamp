@@ -23,7 +23,7 @@ from sqlglot import exp
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_MAP_PATH = Path(__file__).parent / "schema_map.json"
+_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
 
 
 class SQLTranslationError(Exception):

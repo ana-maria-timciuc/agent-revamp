@@ -3,7 +3,7 @@ import asyncio
 
 from agent_revamp.agent import Agent
 from agent_revamp.config import settings
-from agent_revamp.state import SessionStore
+from agent_revamp.core.state import SessionStore
 
 
 def _print_sessions() -> None:

@@ -185,7 +185,7 @@
     "generate_report": {
       "type": "report",
       "data_key": "data_preview",
-      "keep_keys": ["token", "question_id", "has_account_id_param", "status", "viz_type", "row_count"]
+      "keep_keys": ["token", "question_id", "figure_json", "has_account_id_param", "status", "viz_type", "row_count"]
     }
   }
 }

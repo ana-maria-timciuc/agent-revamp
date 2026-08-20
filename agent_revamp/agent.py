@@ -9,15 +9,15 @@ from fastmcp import Client as MCPClient
 from openai import AsyncOpenAI
 
 from agent_revamp.config import settings
-from agent_revamp.mcp_tools import call_tool_safe
-from agent_revamp.preprocess.leak_guard import sanitize_user_text
+from agent_revamp.core.mcp_tools import call_tool_safe
+from agent_revamp.postprocess.leak_guard import sanitize_user_text
 from agent_revamp.preprocess.process_class import ProcessClass, ToolScopeError, filter_tools, validate_tool_scope
-from agent_revamp.preprocess.result_sanitizer import sanitize_tool_result
+from agent_revamp.postprocess.result_sanitizer import sanitize_tool_result
 from agent_revamp.preprocess.schema_mapper import build_schema_prompt
 from agent_revamp.preprocess.sql_translator import SQLTranslationError, translate_sql
 from agent_revamp.preprocess.tool_sanitizer import inject_account_id, sanitize_tool_schema, translate_tool_args
-from agent_revamp.state import SessionStore
-from agent_revamp.vector import Embedder, SkillIndex, ToolIndex
+from agent_revamp.core.state import SessionStore
+from agent_revamp.core.vector import Embedder, SkillIndex, ToolIndex
 
 _SQL_TOOLS = {"execute_query", "generate_report"}
 
@@ -43,6 +43,72 @@ _SYSTEM_PROMPT = (
     "for querying and reporting on the platform's database."
 )
 
+# Map an internal tool name to a human-friendly progress caption (mirrors the original
+# realbooks-agents harness for SSE `tools` events).
+_TOOL_STATUS_LABELS = {
+    "execute_query": "Looking that up",
+    "generate_report": "Putting your report together",
+    "get_account_profile": "Looking that up",
+    "get_database_schema": "Looking that up",
+    "search_market_data": "Searching the web",
+    "fetch_page_content": "Reading a page",
+}
+_DEFAULT_STATUS_LABEL = "Working on it"
+
+_MONEY_HINTS = (
+    "income",
+    "expense",
+    "net",
+    "total",
+    "amount",
+    "noi",
+    "profit",
+    "loss",
+    "revenue",
+    "cost",
+    "balance",
+    "rent",
+    "payment",
+    "budget",
+    "spent",
+)
+
+
+def _status_label(tool_name: str) -> str:
+    if tool_name in _TOOL_STATUS_LABELS:
+        return _TOOL_STATUS_LABELS[tool_name]
+    if tool_name.startswith("create_"):
+        return "Saving your changes"
+    if tool_name.startswith(("list_", "get_")):
+        return "Looking that up"
+    return _DEFAULT_STATUS_LABEL
+
+
+def _fmt_money(value: float) -> str:
+    return ("-$" if value < 0 else "$") + f"{abs(value):,.2f}"
+
+
+def _format_key_figures(data_preview) -> str:
+    """For a single-row totals/scalar report, surface the money figures by column name.
+    Empty for multi-row or non-financial previews — the chart already shows those."""
+    if not isinstance(data_preview, list) or len(data_preview) != 1 or not isinstance(data_preview[0], dict):
+        return ""
+    parts = [
+        f"{key.replace('_', ' ').title()}: {_fmt_money(val)}"
+        for key, val in data_preview[0].items()
+        if isinstance(val, int | float)
+        and not isinstance(val, bool)
+        and any(hint in key.lower() for hint in _MONEY_HINTS)
+    ]
+    return " · ".join(parts)
+
+
+def _report_summary_message(title: str, data_preview) -> str:
+    """Confirmation shown with a generated report, built without a second LLM call."""
+    base = f"Here is your **{title}**." if title else "Here is your report."
+    figures = _format_key_figures(data_preview)
+    return f"{base} {figures}" if figures else base
+
 
 class Agent:
     def __init__(
@@ -54,6 +120,7 @@ class Agent:
         session_id: str | None = None,
         state_dir: str | None = None,
         process_class: ProcessClass | None = None,
+        account_id: int | None = None,
     ):
         self.mcp_url = mcp_url or settings.penny_mcp_url
         self.model = model or settings.openai_model
@@ -63,6 +130,7 @@ class Agent:
         # has a dedicated Intent classifier stage upstream of Agent to make that call
         # dynamically per message — not built yet.
         self.process_class: ProcessClass = process_class or settings.process_class
+        self.account_id: int | None = account_id
         self.system_prompt = system_prompt
         self.session_id = session_id or _new_session_id()
         self.store = SessionStore(state_dir or settings.state_dir)
@@ -73,6 +141,8 @@ class Agent:
         self._openai_tools: list[dict] = []
         self._tool_index: ToolIndex | None = None
         self._skill_index: SkillIndex | None = None
+        self.tokens_used = 0
+        self.last_report_payload: dict | None = None
 
     async def __aenter__(self) -> "Agent":
         saved = self.store.load(self.session_id)
@@ -190,10 +260,15 @@ class Agent:
         chunks = await self._skill_index.search_skills(query)
         return chunks or []
 
-    async def chat(self, user_message: str) -> str:
+    async def chat(self, user_message: str, event_sink: Callable[[dict], Awaitable[None]] | None = None) -> str:
         """Single conversational turn — runs the bounded tool-call loop internally and
         returns the model's final natural-language answer. History persists on
-        self.messages across calls and to disk after each turn."""
+        self.messages across calls and to disk after each turn.
+
+        With `event_sink` set (the API/SSE path), the turn runs in streaming mode and
+        emits `tools`/`stage`/`token` events (sanitized per-chunk); without it, behavior
+        is unchanged and the reply is returned whole.
+        """
         turn_start_idx = len(self.messages)
         self.messages.append({"role": "user", "content": user_message})
         client = _get_openai()
@@ -228,9 +303,15 @@ class Agent:
             if tools:
                 kwargs.update(tools=tools, tool_choice="auto", parallel_tool_calls=True)
 
-            response = await client.chat.completions.create(**kwargs)
-            message = response.choices[0].message
-            message_dict = message.model_dump(exclude_none=True)
+            if event_sink is not None:
+                message, message_dict, usage = await self._stream_completion(kwargs, event_sink)
+            else:
+                response = await client.chat.completions.create(**kwargs)
+                message = response.choices[0].message
+                message_dict = message.model_dump(exclude_none=True)
+                usage = getattr(response.usage, "total_tokens", 0) or 0
+            self.tokens_used += usage
+
             # Last line of defense: strip anything that slipped through the preprocess layer
             # (a hallucinated real name, a recited friendly label, pasted SQL) before this text
             # is shown to the user OR persisted — persisted history is replayed as context on
@@ -243,12 +324,92 @@ class Agent:
                 self._persist()
                 return message_dict.get("content") or ""
 
+            if event_sink is not None:
+                await event_sink(
+                    {"type": "tools", "tools": list(dict.fromkeys(_status_label(tc.function.name) for tc in message.tool_calls))}
+                )
+                await event_sink({"type": "stage", "stage": "executing"})
+
             results = await asyncio.gather(*(self._dispatch(tc) for tc in message.tool_calls))
             for tool_call_id, content in results:
                 self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
 
+            # Skip the second LLM round-trip after a successful report — its only job is to
+            # describe a chart the UI already renders (mirrors realbooks-agents harness).
+            if self.last_report_payload and self.last_report_payload.get("token"):
+                summary = sanitize_user_text(
+                    _report_summary_message(
+                        self.last_report_payload.get("title", ""),
+                        self.last_report_payload.get("data_preview"),
+                    )
+                )
+                self.messages.append({"role": "assistant", "content": summary})
+                if event_sink is not None:
+                    await event_sink({"type": "token", "content": summary})
+                self._persist()
+                return summary
+
         self._persist()
         return "Reached the maximum number of tool-call steps without a final answer."
+
+    async def _stream_completion(self, openai_kwargs: dict, event_sink) -> tuple[object, dict, int]:
+        """Stream a chat completion, emitting sanitized token events and reassembling
+        tool-call deltas by index. Ported from realbooks-agents harness._stream_completion.
+        Returns (message shim, message dict, token count) — shape-equivalent to the
+        non-streamed path so the loop is unchanged.
+        """
+        from types import SimpleNamespace
+
+        from agent_revamp.postprocess.stream_sanitizer import emit_sanitized
+
+        kwargs = {**openai_kwargs, "stream": True, "stream_options": {"include_usage": True}}
+        content_parts: list[str] = []
+        tool_acc: dict[int, dict] = {}
+        usage_tokens = 0
+        emit_buf: dict = {}
+
+        stream = await _get_openai().chat.completions.create(**kwargs)
+        async for chunk in stream:
+            if chunk.usage:
+                usage_tokens = chunk.usage.total_tokens
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content_parts.append(delta.content)
+                await emit_sanitized(event_sink, emit_buf, delta.content)
+            for tcd in delta.tool_calls or []:
+                slot = tool_acc.setdefault(tcd.index, {"id": None, "name": "", "arguments": ""})
+                if tcd.id:
+                    slot["id"] = tcd.id
+                if tcd.function and tcd.function.name:
+                    slot["name"] = tcd.function.name
+                if tcd.function and tcd.function.arguments:
+                    slot["arguments"] += tcd.function.arguments
+
+        await emit_sanitized(event_sink, emit_buf, final=True)
+        content = "".join(content_parts)
+        tool_calls = [
+            SimpleNamespace(
+                id=s["id"],
+                type="function",
+                function=SimpleNamespace(name=s["name"], arguments=s["arguments"]),
+            )
+            for _, s in sorted(tool_acc.items())
+        ]
+
+        msg_dict: dict = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ]
+        msg = SimpleNamespace(content=content or None, tool_calls=(tool_calls or None))
+        return msg, msg_dict, usage_tokens
 
     async def _dispatch(self, tool_call) -> tuple[str, str]:
         name = tool_call.function.name
@@ -257,8 +418,9 @@ class Agent:
         except json.JSONDecodeError as exc:
             return tool_call.id, json.dumps({"error": f"invalid tool arguments: {exc}"})
 
+        raw_args = args
         args = translate_tool_args(name, args)
-        args = inject_account_id(name, args)
+        args = inject_account_id(name, args, self.account_id)
         if name in _SQL_TOOLS and "sql" in args:
             try:
                 args["sql"] = translate_sql(args["sql"], account_id=args["account_id"])
@@ -267,4 +429,6 @@ class Agent:
 
         content = await call_tool_safe(self._mcp, name, args)
         content = sanitize_tool_result(content, name)
+        if name == "generate_report":
+            self.last_report_payload = _extract_report_payload(content, raw_args.get("title"))
         return tool_call.id, content

@@ -20,7 +20,7 @@ from typing import Any
 
 from agent_revamp.config import settings
 
-_SCHEMA_MAP_PATH = Path(__file__).parent / "schema_map.json"
+_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
 
 
 def _load_map() -> dict[str, Any]:
@@ -103,15 +103,16 @@ def translate_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     return {reverse.get(key, key): value for key, value in args.items()}
 
 
-def inject_account_id(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Overwrite account_id with the pinned config value for tools that hide it.
+def inject_account_id(tool_name: str, args: dict[str, Any], account_id: int | None = None) -> dict[str, Any]:
+    """Overwrite account_id with the caller's account for tools that hide it.
 
     The model never sees account_id as a fillable parameter (sanitize_tool_schema drops it
     when listed in tool_hidden_args), so nothing it outputs for that field can be trusted —
     this always replaces it before the call reaches penny-mcp, regardless of what (if
-    anything) is present in args.
+    anything) is present in args. Defaults to the pinned config value when the caller
+    (e.g. the CLI) has no per-user identity.
     """
     if "account_id" in _hidden_args(tool_name):
         args = dict(args)
-        args["account_id"] = settings.default_account_id
+        args["account_id"] = settings.default_account_id if account_id is None else account_id
     return args

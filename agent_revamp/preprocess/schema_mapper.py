@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-_SCHEMA_MAP_PATH = Path(__file__).parent / "schema_map.json"
+_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
 
 
 def _load_map() -> dict[str, Any]:
