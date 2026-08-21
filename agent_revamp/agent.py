@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,22 @@ def _extract_report_payload(content: str, title: str | None) -> dict:
     if title:
         payload["title"] = title
     return payload
+
+def _is_error_result(content: str) -> bool:
+    """Best-effort check for call_tool_safe's `{"error": ...}` shape (timeout, exception,
+    or an invalid-argument/SQL-translation rejection), used only to label a turn's tool
+    trace ok/error for the state manager — never affects control flow."""
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
+
+
+# Upper bound on per-session turn traces kept in the state file, mirroring the same
+# "don't let a long-lived session grow unbounded" reasoning as MAX_HISTORY_MESSAGES for
+# messages — a trace entry is small, but a session reused for months shouldn't grow forever.
+_MAX_TRACKED_TURNS = 200
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +193,10 @@ class Agent:
         self._pipeline: PreprocessPipeline | None = None
         self.tokens_used = 0
         self.last_report_payload: dict | None = None
+        # Per-response trace for the state manager: time, tokens, tools, and the status
+        # of every stage the response passed through (see _record_turn). Persisted
+        # alongside self.messages, loaded back in __aenter__ for a resumed session.
+        self.turns: list[dict] = []
 
     async def __aenter__(self) -> "Agent":
         saved = self.store.load(self.session_id)
@@ -183,6 +204,7 @@ class Agent:
             self.messages = [{"role": "system", "content": self.system_prompt}]
             self.messages.extend(m for m in saved.get("messages", []) if m.get("role") != "system")
             self._created_at = saved.get("created_at", self._created_at)
+            self.turns = list(saved.get("turns", []))
 
         self._mcp = MCPClient(self.mcp_url)
         await self._mcp.__aenter__()
@@ -256,7 +278,38 @@ class Agent:
     def _persist(self) -> None:
         if self._deleted:
             return
-        self.store.save(self.session_id, self.messages, self.model, created_at=self._created_at)
+        self.store.save(
+            self.session_id, self.messages, self.model, created_at=self._created_at, turns=self.turns
+        )
+
+    def _record_turn(
+        self,
+        started_at: datetime,
+        clock_start: float,
+        tokens_before: int,
+        variables: dict,
+        stages: dict[str, str],
+        tools_trace: list[dict],
+    ) -> None:
+        """Append one entry to self.turns — the state manager's per-response trace:
+        wall-clock timing, tokens spent this turn, the context variables that shaped it,
+        the status of every stage the diagram's Preprocess/MCP/Postprocess boxes cover,
+        and every tool call dispatched. Persisted by the next _persist() call."""
+        self.turns.append(
+            {
+                "turn_index": len(self.turns),
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": round((time.monotonic() - clock_start) * 1000, 1),
+                "tokens_used": self.tokens_used - tokens_before,
+                "tokens_total": self.tokens_used,
+                "variables": variables,
+                "stages": stages,
+                "tools": tools_trace,
+            }
+        )
+        if len(self.turns) > _MAX_TRACKED_TURNS:
+            self.turns = self.turns[-_MAX_TRACKED_TURNS:]
 
     def delete_session(self) -> bool:
         """Delete this session's cached history from disk. The final save on
@@ -305,7 +358,21 @@ class Agent:
         self.messages.append({"role": "user", "content": user_message})
         client = _get_openai()
 
+        turn_started_at = datetime.now(timezone.utc)
+        turn_clock_start = time.monotonic()
+        tokens_before = self.tokens_used
+        stages: dict[str, str] = {"report_short_circuit": "no"}
+        tools_trace: list[dict] = []
+
         package = await self._run_preprocessing(user_message)
+        if package is None:
+            stages["preprocess"] = "skipped (no pipeline)"
+        else:
+            stages["preprocess"] = (
+                f"ran (skills={len(package.skills)}, tools={len(package.tools)}, "
+                f"skills_reranker={'passed' if package.skills_passed else 'failed'}, "
+                f"tools_reranker={'passed' if package.tools_passed else 'failed'})"
+            )
 
         # Three-way tool-candidate fallback: no pipeline, or the pipeline retrieved zero
         # tool candidates -> fall back to the full (process-class-filtered) tool set.
@@ -326,12 +393,21 @@ class Agent:
         # Intent is gated on is_confident (>= 0.6) so a low-confidence guess never
         # pollutes the prompt.
         extra_system: list[str] = []
+        variables: dict = {
+            "process_class": self.process_class,
+            "account_id": self.account_id,
+            "model": self.model,
+            "tools_offered": len(tools),
+        }
         if package is not None and package.intent.is_confident:
             extra_system.append(
                 f"--- Detected intent: {package.intent.intent} (confidence={package.intent.confidence:.2f}) ---"
             )
+            variables["intent"] = package.intent.intent
+            variables["intent_confidence"] = round(package.intent.confidence, 2)
         if skills:
             extra_system.append("--- Relevant skills for this request ---\n" + "\n\n".join(skills))
+            variables["skills_retrieved"] = len(skills)
 
         # Second, independent check (filter_tools in __aenter__ is the first): assert every
         # tool about to be shown to the model this turn is within this process class's
@@ -340,8 +416,11 @@ class Agent:
         # run under a different process class) — see preprocess/process_class.py.
         try:
             validate_tool_scope([t["function"]["name"] for t in tools], self.process_class)
+            stages["tool_scope_validation"] = "passed"
         except ToolScopeError as exc:
             logger.error("Tool-scope validation failed, refusing turn: %s", exc)
+            stages["tool_scope_validation"] = f"blocked: {exc}"
+            self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
             self._persist()
             return "Internal error: this request was blocked by a tool-scope safety check."
 
@@ -368,9 +447,12 @@ class Agent:
             # every future turn, so an unsanitized leak here would resurface indefinitely.
             if isinstance(message_dict.get("content"), str):
                 message_dict["content"] = sanitize_user_text(message_dict["content"])
+                stages["postprocess"] = "response sanitized (sanitize_user_text)"
             self.messages.append(message_dict)
 
             if not message.tool_calls:
+                stages.setdefault("tool_dispatch", "skipped (no tool calls)")
+                self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
                 self._persist()
                 return message_dict.get("content") or ""
 
@@ -381,8 +463,14 @@ class Agent:
                 await event_sink({"type": "stage", "stage": "executing"})
 
             results = await asyncio.gather(*(self._dispatch(tc) for tc in message.tool_calls))
-            for tool_call_id, content in results:
+            for tc, (tool_call_id, content, status) in zip(message.tool_calls, results, strict=True):
+                tools_trace.append({"name": tc.function.name, "status": status})
                 self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+            error_count = sum(1 for t in tools_trace if t["status"] == "error")
+            stages["tool_dispatch"] = f"ok ({len(tools_trace)} call(s))" if not error_count else (
+                f"{error_count}/{len(tools_trace)} call(s) errored"
+            )
+            stages.setdefault("postprocess", "tool results sanitized (result_sanitizer + leak_guard)")
 
             # Skip the second LLM round-trip after a successful report — its only job is to
             # describe a chart the UI already renders (mirrors realbooks-agents harness).
@@ -396,9 +484,13 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": summary})
                 if event_sink is not None:
                     await event_sink({"type": "token", "content": summary})
+                stages["report_short_circuit"] = "yes"
+                self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
                 self._persist()
                 return summary
 
+        stages["tool_dispatch"] = stages.get("tool_dispatch", "n/a") + " — max iterations reached"
+        self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
         self._persist()
         return "Reached the maximum number of tool-call steps without a final answer."
 
@@ -461,12 +553,15 @@ class Agent:
         msg = SimpleNamespace(content=content or None, tool_calls=(tool_calls or None))
         return msg, msg_dict, usage_tokens
 
-    async def _dispatch(self, tool_call) -> tuple[str, str]:
+    async def _dispatch(self, tool_call) -> tuple[str, str, str]:
+        """Returns (tool_call_id, content, status) — status is "ok"/"error", used only
+        by chat() to build this turn's state-manager tool trace, never for control flow."""
         name = tool_call.function.name
         try:
             args = json.loads(tool_call.function.arguments or "{}")
         except json.JSONDecodeError as exc:
-            return tool_call.id, json.dumps({"error": f"invalid tool arguments: {exc}"})
+            content = json.dumps({"error": f"invalid tool arguments: {exc}"})
+            return tool_call.id, content, "error"
 
         raw_args = args
         args = translate_tool_args(name, args)
@@ -475,7 +570,8 @@ class Agent:
             try:
                 args["sql"] = translate_sql(args["sql"], account_id=args["account_id"])
             except SQLTranslationError as exc:
-                return tool_call.id, json.dumps({"error": str(exc)})
+                content = json.dumps({"error": str(exc)})
+                return tool_call.id, content, "error"
 
         content = await call_tool_safe(self._mcp, name, args)
         content = sanitize_tool_result(content, name)
@@ -488,4 +584,4 @@ class Agent:
         content = redact_real_schema_leaks(content)
         if name == "generate_report":
             self.last_report_payload = _extract_report_payload(content, raw_args.get("title"))
-        return tool_call.id, content
+        return tool_call.id, content, ("error" if _is_error_result(content) else "ok")

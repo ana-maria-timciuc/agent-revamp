@@ -15,7 +15,10 @@ def _print_sessions() -> None:
         return
     print("Saved sessions:")
     for s in sessions:
-        print(f"  {s['session_id']}  {s['model']}  {s['message_count']} msgs  updated {s['updated_at']}")
+        print(
+            f"  {s['session_id']}  {s['model']}  {s['message_count']} msgs  "
+            f"{s['turn_count']} turns  updated {s['updated_at']}"
+        )
 
 
 def _delete_session(session_id: str) -> None:

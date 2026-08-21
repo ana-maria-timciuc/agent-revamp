@@ -7,8 +7,27 @@ One JSON file per session in STATE_DIR, following the "by JSON template" shape:
         "created_at": "ISO timestamp",
         "updated_at": "ISO timestamp",
         "model": "gpt-5",
-        "messages": [{role, content, ...}, ...]
+        "messages": [{role, content, ...}, ...],
+        "turns": [
+            {
+                "turn_index": 0,
+                "started_at": "ISO timestamp",
+                "finished_at": "ISO timestamp",
+                "duration_ms": 842.1,
+                "tokens_used": 512,
+                "tokens_total": 512,
+                "variables": {"process_class": "penny", "account_id": 7, ...},
+                "stages": {"preprocess": "...", "tool_scope_validation": "...", ...},
+                "tools": [{"name": "execute_query", "status": "ok"}, ...]
+            },
+            ...
+        ]
     }
+
+`turns` is the per-response trace the diagram's "State manager" box implies (dashed
+lines fanning out to every other box) — one entry per `Agent.chat()` call, built in
+`agent.py::Agent._record_turn`. It is opaque to this module; `SessionStore` just
+persists whatever list it's handed alongside `messages`.
 
 Writes are atomic (temp file + rename). Corrupt or missing files are treated
 as absent rather than raising, so a bad state file never blocks a session.
@@ -49,6 +68,7 @@ class SessionStore:
                         "updated_at": data.get("updated_at", ""),
                         "model": data.get("model", ""),
                         "message_count": len(data.get("messages", [])),
+                        "turn_count": len(data.get("turns", [])),
                     }
                 )
         return sessions
@@ -67,13 +87,21 @@ class SessionStore:
             logger.warning("Ignoring corrupt session file %s: %s", path, exc)
             return None
 
-    def save(self, session_id: str, messages: list[dict], model: str, created_at: str | None = None) -> None:
+    def save(
+        self,
+        session_id: str,
+        messages: list[dict],
+        model: str,
+        created_at: str | None = None,
+        turns: list[dict] | None = None,
+    ) -> None:
         data = {
             "session_id": session_id,
             "created_at": created_at or _now(),
             "updated_at": _now(),
             "model": model,
             "messages": messages,
+            "turns": turns or [],
         }
         path = _session_path(self.state_dir, session_id)
         tmp = path.with_suffix(".tmp")

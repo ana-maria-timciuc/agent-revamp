@@ -6,6 +6,7 @@ at the module-level singleton agent.py uses (_get_openai()/_openai_client).
 
 import asyncio
 import json
+import tempfile
 from types import SimpleNamespace
 
 import agent_revamp.agent as agent_module
@@ -20,7 +21,9 @@ def _run(coro):
 
 
 def _make_agent():
-    agent = Agent(process_class="penny")
+    # A dedicated temp state_dir per agent — otherwise every chat() call here would
+    # persist a real session file into this project's actual state/ directory.
+    agent = Agent(process_class="penny", state_dir=tempfile.mkdtemp(prefix="agent_revamp_test_state_"))
     agent._tool_schemas = {
         "execute_query": {"type": "function", "function": {"name": "execute_query", "parameters": {}}},
         "generate_report": {"type": "function", "function": {"name": "generate_report", "parameters": {}}},
@@ -147,12 +150,74 @@ def test_dispatch_redacts_a_raw_db_error_before_it_enters_the_model_or_persisted
         function=SimpleNamespace(name="execute_query", arguments=json.dumps({"sql": "SELECT 1"})),
     )
 
-    _, content = _run(agent._dispatch(tool_call))
+    _, content, status = _run(agent._dispatch(tool_call))
 
     assert "flow_type" not in content
     assert "account_id" not in content
+    assert status == "error"
     parsed = json.loads(content)
     assert "Type" in parsed["error"]  # substituted with the friendly name, not just blanked
+
+
+def test_chat_records_a_turn_trace_with_timing_tokens_and_stage_status(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    _run(agent.chat("hello"))
+
+    assert len(agent.turns) == 1
+    turn = agent.turns[0]
+    assert turn["turn_index"] == 0
+    assert turn["tokens_used"] == 10
+    assert turn["tokens_total"] == 10
+    assert turn["duration_ms"] >= 0
+    assert turn["variables"]["process_class"] == "penny"
+    assert turn["variables"]["tools_offered"] == 2
+    assert turn["stages"]["preprocess"] == "skipped (no pipeline)"
+    assert turn["stages"]["tool_scope_validation"] == "passed"
+    assert turn["stages"]["tool_dispatch"] == "skipped (no tool calls)"
+    assert turn["tools"] == []
+
+    # Persisted alongside messages, and reloaded on session resume.
+    reloaded = agent.store.load(agent.session_id)
+    assert len(reloaded["turns"]) == 1
+    assert reloaded["turns"][0]["tokens_used"] == 10
+
+
+def test_chat_traces_a_failed_tool_call_as_error_status(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+
+    call_count = {"n": 0}
+
+    async def create(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            tool_call = SimpleNamespace(
+                id="call_1", function=SimpleNamespace(name="execute_query", arguments="not json")
+            )
+            message = SimpleNamespace(content=None, tool_calls=[tool_call])
+            message.model_dump = lambda exclude_none=True: {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "execute_query", "arguments": "not json"}}],
+            }
+        else:
+            message = SimpleNamespace(content="final answer", tool_calls=None)
+            message.model_dump = lambda exclude_none=True: {"role": "assistant", "content": "final answer"}
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=SimpleNamespace(total_tokens=5))
+
+    monkeypatch.setattr(
+        agent_module, "_openai_client", SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    )
+
+    _run(agent.chat("hello"))
+
+    turn = agent.turns[0]
+    assert turn["tools"] == [{"name": "execute_query", "status": "error"}]
+    assert turn["stages"]["tool_dispatch"] == "1/1 call(s) errored"
+    assert turn["tokens_used"] == 10  # two round-trips, 5 tokens each
 
 
 def test_low_confidence_intent_is_not_surfaced_in_the_prompt(monkeypatch):
