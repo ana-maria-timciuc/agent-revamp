@@ -103,6 +103,44 @@ if anything slipped through — specifically a guard against the Qdrant-based to
 (the preprocess pipeline, see below) ever surfacing something out of scope, e.g. from a
 shared `QDRANT_TOOLS_COLLECTION` carrying entries from a different process class.
 
+This is the diagram's **"Validate tools"** box (between MCP and the model) — not to be
+confused with the diagram's separate **"Validation"** box inside Postprocess, which judges
+the model's *finished answer* rather than which tools it may call. See "Postprocess
+Validation gate" below for that one.
+
+## Postprocess Validation gate (`postprocess/validation.py::ResponseValidator`)
+
+Implements the diagram's Postprocess-zone `Validation -> Yes: Answer / No: [loop back to
+Agent]` box, added 2026-08-21. Runs once per turn, only on a model-authored final answer
+(not the `generate_report` short-circuit summary or the max-iterations fallback message —
+those aren't model-authored free text, so `Agent.chat()` marks their `validation` stage
+`"n/a"` instead of running the gate).
+
+Two checks, cheapest and most decisive first:
+1. **`check_leak_safety`** — deterministic and free: compares the model's raw text to what
+   `postprocess/leak_guard.py::sanitize_user_text()` turned it into. Any difference means
+   the sanitizer had to redact or substitute something, i.e. the model attempted to reveal
+   internal schema/SQL — automatic fail, no LLM call needed.
+2. **`check_quality`** — one extra `chat.completions.create` call (JSON-mode), only made
+   when the leak-safety check passed, asking whether the sanitized answer is a genuine,
+   on-topic attempt at the user's question. This is a quality gate, not a security boundary
+   — leak_guard already guarantees the text is safe regardless of this check's outcome — so
+   any exception or malformed JSON from the judge **fails open** (treated as passed) rather
+   than blocking the turn.
+
+Wired into `Agent.chat()`'s no-tool-calls branch: on failure, the rejected assistant message
+is popped back off `self.messages` (never replayed as context) and replaced with a corrective
+system message, then the turn loops back into another completion round — bounded by
+`MAX_VALIDATION_RETRIES` (default 2, independent of but nested inside `MAX_TOOL_ITERATIONS`).
+If the retry budget is exhausted, the turn returns a fixed generic fallback message
+(`agent.py::_VALIDATION_FALLBACK_MESSAGE`) — never the flagged text, even sanitized.
+
+**Streaming is a deliberate exception**: on the `event_sink` (SSE) path, tokens are already
+emitted live to the client as they're generated (`_stream_completion`/`stream_sanitizer`) —
+by the time a full answer exists to validate, there's nothing left to retract. The gate still
+runs there and records its verdict in the state manager's `validation` stage for
+observability, but never triggers a retry on that path.
+
 ## Preprocess pipeline: intent classifier -> RAG -> reranker
 
 `agent_revamp/preprocess/` holds one consolidated pipeline (`pipeline.py::PreprocessPipeline`)
@@ -204,7 +242,9 @@ iterations exhausted). Each entry captures:
 - **Stages**: one status string per box the diagram draws — `preprocess` (ran with
   skill/tool/reranker counts, or skipped if Qdrant/indexing was down),
   `tool_scope_validation` (passed/blocked), `tool_dispatch` (call count / error count),
-  `postprocess` (which sanitizer ran), `report_short_circuit` (yes/no).
+  `postprocess` (which sanitizer ran), `validation` (passed/failed-with-retry-count/
+  retries-exhausted/skipped-streaming/n-a — see "Postprocess Validation gate" below),
+  `report_short_circuit` (yes/no).
 - **Tools**: `[{"name": ..., "status": "ok"|"error"}, ...]` for every tool call dispatched
   that turn — `"error"` is a best-effort check (`agent.py::_is_error_result`) for
   `call_tool_safe`'s `{"error": ...}` shape; it only labels the trace, never affects control

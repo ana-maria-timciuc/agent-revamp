@@ -23,6 +23,7 @@ from agent_revamp.preprocess.catalog import CatalogEntry, KIND_SKILL, KIND_TOOL,
 from agent_revamp.preprocess.embeddings import OpenAIEmbeddingService
 from agent_revamp.preprocess.intent import LLMIntentClassifier
 from agent_revamp.preprocess.pipeline import ContextPackage, PreprocessPipeline
+from agent_revamp.postprocess.validation import ResponseValidator
 
 _SQL_TOOLS = {"execute_query", "generate_report"}
 
@@ -71,6 +72,11 @@ def _is_error_result(content: str) -> bool:
 # "don't let a long-lived session grow unbounded" reasoning as MAX_HISTORY_MESSAGES for
 # messages — a trace entry is small, but a session reused for months shouldn't grow forever.
 _MAX_TRACKED_TURNS = 200
+
+# Returned in place of a model-authored answer that failed postprocess Validation and
+# exhausted its retry budget (agent.py::chat, non-streaming path) — never the flagged
+# text itself, even sanitized.
+_VALIDATION_FALLBACK_MESSAGE = "I couldn't put together a clean answer to that — could you try rephrasing your question?"
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +197,7 @@ class Agent:
         self._mcp: MCPClient | None = None
         self._openai_tools: list[dict] = []
         self._pipeline: PreprocessPipeline | None = None
+        self._validator: ResponseValidator | None = None
         self.tokens_used = 0
         self.last_report_payload: dict | None = None
         # Per-response trace for the state manager: time, tokens, tools, and the status
@@ -245,6 +252,17 @@ class Agent:
         except Exception as exc:
             logger.warning("Qdrant init failed, continuing without vector index: %s", exc)
             self._pipeline = None
+
+        # Postprocess "Validation" gate (diagram: Postprocess -> Validation -> Yes/No),
+        # see postprocess/validation.py. Independent of the Qdrant pipeline above — only
+        # needs an OpenAI client, which the rest of the agent already requires to function
+        # at all — but guarded the same defensive way so a construction hiccup degrades
+        # to "no gate" instead of blocking startup.
+        try:
+            self._validator = ResponseValidator(client=_get_openai())
+        except Exception as exc:
+            logger.warning("Response validator init failed, continuing without it: %s", exc)
+            self._validator = None
 
         # The model never sees penny-mcp's real db://schema resource (real table/column
         # names) — it gets the friendly-only catalog built from preprocess/schema_map.json
@@ -363,6 +381,7 @@ class Agent:
         tokens_before = self.tokens_used
         stages: dict[str, str] = {"report_short_circuit": "no"}
         tools_trace: list[dict] = []
+        validation_attempts = 0
 
         package = await self._run_preprocessing(user_message)
         if package is None:
@@ -445,16 +464,60 @@ class Agent:
             # (a hallucinated real name, a recited friendly label, pasted SQL) before this text
             # is shown to the user OR persisted — persisted history is replayed as context on
             # every future turn, so an unsanitized leak here would resurface indefinitely.
-            if isinstance(message_dict.get("content"), str):
-                message_dict["content"] = sanitize_user_text(message_dict["content"])
+            raw_content = message_dict.get("content") if isinstance(message_dict.get("content"), str) else None
+            if raw_content is not None:
+                message_dict["content"] = sanitize_user_text(raw_content)
                 stages["postprocess"] = "response sanitized (sanitize_user_text)"
             self.messages.append(message_dict)
 
             if not message.tool_calls:
                 stages.setdefault("tool_dispatch", "skipped (no tool calls)")
+                sanitized = message_dict.get("content") or ""
+
+                # Postprocess "Validation" gate (diagram: Postprocess -> Validation ->
+                # Yes: Answer / No: loop back to Agent). Only applies to a model-authored
+                # final answer — the report short-circuit and max-iterations fallback
+                # below aren't model-authored free text, so they mark "n/a" instead.
+                if self._validator is None or raw_content is None:
+                    stages["validation"] = "skipped (no validator)"
+                elif event_sink is not None:
+                    # Streaming: tokens were already emitted live to the client as they
+                    # were generated (see _stream_completion) — there is nothing left to
+                    # retract, so we still record the verdict for the state manager's
+                    # trace but never retry.
+                    result = await self._validator.validate(user_message, raw_content, sanitized, self.model)
+                    stages["validation"] = (
+                        "passed" if result.passed else f"failed: {result.reason} (not retried — streaming)"
+                    )
+                else:
+                    result = await self._validator.validate(user_message, raw_content, sanitized, self.model)
+                    if result.passed:
+                        stages["validation"] = "passed"
+                    elif validation_attempts < settings.max_validation_retries:
+                        validation_attempts += 1
+                        stages["validation"] = f"failed: {result.reason} (retry {validation_attempts})"
+                        self.messages.pop()  # drop the rejected answer — never replay it as context
+                        self.messages.append(
+                            {
+                                "role": "system",
+                                "content": f"Your previous answer was rejected by validation "
+                                f"({result.reason}). Answer again.",
+                            }
+                        )
+                        continue
+                    else:
+                        stages["validation"] = f"failed: {result.reason} — retries exhausted, fallback returned"
+                        self.messages.pop()
+                        self.messages.append({"role": "assistant", "content": _VALIDATION_FALLBACK_MESSAGE})
+                        self._record_turn(
+                            turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace
+                        )
+                        self._persist()
+                        return _VALIDATION_FALLBACK_MESSAGE
+
                 self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
                 self._persist()
-                return message_dict.get("content") or ""
+                return sanitized
 
             if event_sink is not None:
                 await event_sink(
@@ -485,11 +548,13 @@ class Agent:
                 if event_sink is not None:
                     await event_sink({"type": "token", "content": summary})
                 stages["report_short_circuit"] = "yes"
+                stages["validation"] = "n/a (report short-circuit, not model-authored)"
                 self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
                 self._persist()
                 return summary
 
         stages["tool_dispatch"] = stages.get("tool_dispatch", "n/a") + " — max iterations reached"
+        stages["validation"] = "n/a (max iterations exhausted, not model-authored)"
         self._record_turn(turn_started_at, turn_clock_start, tokens_before, variables, stages, tools_trace)
         self._persist()
         return "Reached the maximum number of tool-call steps without a final answer."

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     )
     rerank_max_retries: int = Field(default=2, alias="RERANK_MAX_RETRIES")
     rerank_retry_top_k_multiplier: int = Field(default=2, alias="RERANK_RETRY_TOP_K_MULTIPLIER")
+    max_validation_retries: int = Field(default=2, alias="MAX_VALIDATION_RETRIES")
 
     default_account_id: int = Field(default=1, alias="DEFAULT_ACCOUNT_ID")
     process_class: ProcessClass = Field(default="penny", alias="PROCESS_CLASS")

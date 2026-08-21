@@ -11,9 +11,11 @@ from types import SimpleNamespace
 
 import agent_revamp.agent as agent_module
 from agent_revamp.agent import Agent
+from agent_revamp.config import settings
 from agent_revamp.preprocess.catalog import CatalogEntry, KIND_SKILL, KIND_TOOL
 from agent_revamp.preprocess.intent import IntentResult
 from agent_revamp.preprocess.pipeline import ContextPackage
+from agent_revamp.postprocess.validation import ValidationResult
 
 
 def _run(coro):
@@ -52,6 +54,32 @@ class _FakePipeline:
 
     async def run(self, msg):
         return self._package_factory(msg)
+
+
+class _FakeValidator:
+    """Queue of canned ValidationResults, one per validate() call, for exercising
+    chat()'s postprocess Validation loop-back without a real judge LLM call."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.call_count = 0
+
+    async def validate(self, user_message, raw_text, sanitized_text, model):
+        self.call_count += 1
+        return self._results.pop(0)
+
+
+def _fake_streaming_openai_client(call_log, content="final answer"):
+    async def create(**kwargs):
+        call_log.append(kwargs)
+
+        async def gen():
+            yield SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=None))])
+            yield SimpleNamespace(usage=SimpleNamespace(total_tokens=10), choices=[])
+
+        return gen()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
 def test_no_pipeline_falls_back_to_the_full_tool_set(monkeypatch):
@@ -234,3 +262,84 @@ def test_low_confidence_intent_is_not_surfaced_in_the_prompt(monkeypatch):
 
     messages = captured[0]["messages"]
     assert not any("Detected intent" in m.get("content", "") for m in messages if m["role"] == "system")
+
+
+def test_validation_failure_loops_back_to_the_agent_then_succeeds(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    agent._validator = _FakeValidator(
+        [ValidationResult(passed=False, reason="leaked schema"), ValidationResult(passed=True, reason="")]
+    )
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    reply = _run(agent.chat("hello"))
+
+    assert reply == "final answer"
+    assert len(captured) == 2  # rejected once, retried, then accepted
+    assert agent._validator.call_count == 2
+    assert agent.turns[-1]["stages"]["validation"] == "passed"
+
+    # The rejected first attempt must not survive into persisted/replayed history.
+    assistant_messages = [m for m in agent.messages if m["role"] == "assistant"]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == "final answer"
+    rejection_notes = [m for m in agent.messages if m["role"] == "system" and "rejected by validation" in m.get("content", "")]
+    assert len(rejection_notes) == 1
+
+
+def test_validation_failure_exhausts_retries_and_returns_fallback(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    total_attempts = settings.max_validation_retries + 1
+    agent._validator = _FakeValidator(
+        [ValidationResult(passed=False, reason="leaked schema") for _ in range(total_attempts)]
+    )
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    reply = _run(agent.chat("hello"))
+
+    assert reply == agent_module._VALIDATION_FALLBACK_MESSAGE
+    assert len(captured) == total_attempts
+    assert agent._validator.call_count == total_attempts
+    assert "retries exhausted" in agent.turns[-1]["stages"]["validation"]
+    # The fallback is what's actually persisted, never the flagged text.
+    assistant_messages = [m for m in agent.messages if m["role"] == "assistant"]
+    assert assistant_messages[-1]["content"] == agent_module._VALIDATION_FALLBACK_MESSAGE
+
+
+def test_streaming_path_records_a_validation_failure_but_never_retries(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    agent._validator = _FakeValidator([ValidationResult(passed=False, reason="off topic")])
+    call_log = []
+    monkeypatch.setattr(agent_module, "_openai_client", _fake_streaming_openai_client(call_log))
+
+    events = []
+
+    async def sink(event):
+        events.append(event)
+
+    reply = _run(agent.chat("hello", event_sink=sink))
+
+    assert reply == "final answer"  # streamed tokens already sent -- never swapped for the fallback
+    assert len(call_log) == 1  # no retry: nothing left to retract once tokens are out
+    assert agent._validator.call_count == 1
+    stage = agent.turns[-1]["stages"]["validation"]
+    assert stage.startswith("failed:")
+    assert "streaming" in stage
+
+
+def test_validation_is_skipped_when_no_validator_is_configured(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    agent._validator = None
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    reply = _run(agent.chat("hello"))
+
+    assert reply == "final answer"
+    assert len(captured) == 1
+    assert agent.turns[-1]["stages"]["validation"] == "skipped (no validator)"
