@@ -109,6 +109,8 @@ def _translate_column(
     lookups: dict[str, Any],
     alias_map: dict[str, str],
     unresolved: set[str],
+    select_aliases: frozenset[str] = frozenset(),
+    derived_aliases: frozenset[str] = frozenset(),
 ) -> None:
     if not _token_is_identifier(node.this):
         return
@@ -139,6 +141,14 @@ def _translate_column(
                 elif hasattr(node.table, "this"):
                     node.table.set("this", exp.Identifier(this=config["real_name"]))
                 table_friendly = tbl_name
+            elif tbl_key not in alias_map and tbl_key in derived_aliases:
+                # Qualified by a derived-table (subquery) alias, not a real table or join
+                # alias. The subquery's own SELECT list has already been translated and
+                # re-aliased to this same friendly name by _alias_selected_columns (which
+                # runs across every exp.Select in the tree, nested ones included), so the
+                # outer reference already matches the derived table's actual output
+                # column — leave it untouched rather than treating it as unresolved.
+                return
             else:
                 table_friendly = alias_map.get(tbl_key, tbl_name)
 
@@ -163,6 +173,11 @@ def _translate_column(
         # Remember the friendly name so the SELECT pass can re-alias the column: the DB
         # returns real column names as result keys, which must not reach the LLM.
         node.meta["friendly_name"] = col_friendly
+    elif not node.table and col_key in select_aliases:
+        # Bare reference to a SELECT-list alias (e.g. "ORDER BY total" where the SELECT
+        # list has "SUM(Amount) AS total") — not a friendly catalog column at all, leave
+        # it untouched rather than treating it as unresolved.
+        return
     else:
         label = f"{table_qualifier_display}.{col_friendly}" if table_qualifier_display else col_friendly
         unresolved.add(label)
@@ -229,11 +244,25 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
     referenced_tables: set[str] = set()
     unresolved: set[str] = set()
 
+    # SELECT-list aliases (e.g. "SUM(Amount) AS total") — a bare ORDER BY/GROUP BY
+    # reference to one of these is not a friendly catalog column and must not be
+    # translated or treated as unresolved.
+    select_aliases = frozenset(
+        expr.alias.lower()
+        for select in tree.find_all(exp.Select)
+        for expr in select.expressions
+        if isinstance(expr, exp.Alias) and expr.alias
+    )
+    # Derived-table (subquery) aliases — a column qualified by one of these already
+    # matches the subquery's own (already-translated) output column name, so it must be
+    # left untouched rather than looked up against the real table/column maps.
+    derived_aliases = frozenset(sq.alias.lower() for sq in tree.find_all(exp.Subquery) if sq.alias)
+
     for table_node in tree.find_all(exp.Table):
         _translate_table(table_node, lookups, referenced_tables, alias_map, unresolved)
 
     for col_node in tree.find_all(exp.Column):
-        _translate_column(col_node, lookups, alias_map, unresolved)
+        _translate_column(col_node, lookups, alias_map, unresolved, select_aliases, derived_aliases)
 
     if unresolved:
         raise SQLTranslationError(

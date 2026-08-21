@@ -4,10 +4,9 @@ Use this skill whenever the user asks about money movement, transactions, income
 
 ## Filtering rules
 
-- Every query must scope to the conversation's `account_id` and exclude soft-deleted rows.
-- Split transactions are child rows linked via `split_transactions_id`. Always exclude children from totals and lists by adding `AND t.split_transactions_id IS NULL` — otherwise amounts get double-counted.
-- `flow_type` is one of `income`, `expense`, `refund`. `flow_category` distinguishes direct vs operational expenses.
-- Loan payments are transactions with `loan_id` set. If the user asks "loan payment history", prefer the loan payment columns: `principle_payment`, `interest_payment`, `escrow_payment`, `pmi_payment`, `fees_late_charges`.
+- Type is one of 'income', 'expense', 'refund'. CategoryGroup distinguishes 'operational' vs 'direct' expenses.
+- Loan payments are transactions with LoanId set. If the user asks for "loan payment history", prefer the loan-payment breakdown columns (PrincipalPaid, InterestPaid, EscrowPaid, PMIPaid, LateFees) over the total Amount.
+- Account scoping, soft-delete exclusion, and split-transaction exclusion are applied automatically — never add these filters yourself.
 
 ## Answering patterns
 

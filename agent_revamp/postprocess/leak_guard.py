@@ -18,6 +18,13 @@ hand-maintained and specific to its own (larger) schema. Here it's built dynamic
 schema_map.json via schema_mapper.real_schema_words(), the same "derived from the catalog,
 not hand-maintained" approach the reference already uses for schema_dot_notation_words() —
 so it stays correct for this project's actual (different, smaller) schema automatically.
+
+One narrow exception: _INTERNAL_PRODUCT_NAMES_RE below is a small, explicitly
+hand-maintained supplement for internal implementation/product names (e.g. "MariaDB")
+that will never appear in schema_map.json — real_schema_words() can only ever derive
+column/table identifiers from the catalog, not the name of the database engine itself —
+so a bare mention needs its own tiny blocklist, redacted regardless of SQL-statement
+context (unlike _SCHEMA_WORDS_RE's dot-notation/statement-scoped siblings).
 """
 
 from __future__ import annotations
@@ -70,6 +77,11 @@ _SCHEMA_WORDS_RE = re.compile(
     r"\b(?:" + "|".join(sorted((re.escape(w) for w in real_schema_words()), reverse=True)) + r")\b",
     re.I,
 )
+
+# Hand-maintained supplement for internal implementation/product names that can never be
+# derived from schema_map.json (it's not a column/table identifier at all) but must never
+# reach the user regardless of surrounding context — see module docstring above.
+_INTERNAL_PRODUCT_NAMES_RE = re.compile(r"\bMariaDB\b", re.I)
 
 # The friendly catalog (schema_map.json) is for the LLM's own SQL-writing, never for describing
 # "how data is stored" to the user — even in safe business-language names. Distinctive PascalCase
@@ -131,6 +143,7 @@ def sanitize_user_text(text: str) -> str:
     )
     out = _TABLE_COL_RE.sub(_REDACTED, out)
     out = _SCHEMA_WORDS_RE.sub(_REDACTED, out)
+    out = _INTERNAL_PRODUCT_NAMES_RE.sub(_REDACTED, out)
     out = _FRIENDLY_SCHEMA_WORDS_RE.sub(lambda m: _FRIENDLY_HUMAN.get(m.group(0), _REDACTED), out)
     out = _PK_LINE_RE.sub(_REDACTED, out)
     out = _SCHEMA_META_RE.sub(_REDACTED, out)

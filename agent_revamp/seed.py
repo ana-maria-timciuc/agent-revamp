@@ -76,9 +76,9 @@ async def _load_tools() -> list[CatalogEntry]:
     await client.__aenter__()
     try:
         tools = await client.list_tools()
-        openai_tools = tools_to_openai_schema(tools)
-        for tool, schema in zip(tools, openai_tools, strict=False):
-            description = tool.description or schema["function"].get("description", "")
+        for tool in tools:
+            schema = sanitize_tool_schema(tool)
+            description = schema["function"].get("description") or tool.description or ""
             content = f"Tool {tool.name}. {description}"
             entries.append(
                 CatalogEntry(
