@@ -18,7 +18,10 @@ from agent_revamp.preprocess.schema_mapper import build_schema_prompt
 from agent_revamp.preprocess.sql_translator import SQLTranslationError, translate_sql
 from agent_revamp.preprocess.tool_sanitizer import inject_account_id, sanitize_tool_schema, translate_tool_args
 from agent_revamp.core.state import SessionStore
-from agent_revamp.core.vector import Embedder, SkillIndex, ToolIndex
+from agent_revamp.preprocess.catalog import CatalogEntry, KIND_SKILL, KIND_TOOL, QdrantCatalog
+from agent_revamp.preprocess.embeddings import OpenAIEmbeddingService
+from agent_revamp.preprocess.intent import LLMIntentClassifier
+from agent_revamp.preprocess.pipeline import ContextPackage, PreprocessPipeline
 
 _SQL_TOOLS = {"execute_query", "generate_report"}
 
@@ -156,10 +159,10 @@ class Agent:
         self.mcp_url = mcp_url or settings.penny_mcp_url
         self.model = model or settings.openai_model
         self.max_iterations = max_iterations or settings.max_tool_iterations
-        # TODO(intent-classifier): process_class is fixed at construction time (config/caller-
-        # supplied) rather than classified from the incoming message. The target architecture
-        # has a dedicated Intent classifier stage upstream of Agent to make that call
-        # dynamically per message — not built yet.
+        # process_class is fixed at construction time (config/caller-supplied) rather than
+        # classified from the incoming message — the intent classifier (preprocess/intent.py)
+        # runs per-message via self._pipeline, but only informs the prompt (see chat()); it
+        # doesn't drive which process_class/tool-allowlist this Agent instance runs as.
         self.process_class: ProcessClass = process_class or settings.process_class
         self.account_id: int | None = account_id
         self.system_prompt = system_prompt
@@ -170,8 +173,7 @@ class Agent:
         self._deleted = False
         self._mcp: MCPClient | None = None
         self._openai_tools: list[dict] = []
-        self._tool_index: ToolIndex | None = None
-        self._skill_index: SkillIndex | None = None
+        self._pipeline: PreprocessPipeline | None = None
         self.tokens_used = 0
         self.last_report_payload: dict | None = None
 

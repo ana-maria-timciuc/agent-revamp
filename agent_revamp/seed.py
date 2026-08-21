@@ -18,10 +18,10 @@ from pathlib import Path
 
 from fastmcp import Client as MCPClient
 
-from agent_revamp.catalog import KIND_SKILL, KIND_TOOL, CatalogEntry, QdrantCatalog
+from agent_revamp.preprocess.catalog import KIND_SKILL, KIND_TOOL, CatalogEntry, QdrantCatalog
 from agent_revamp.config import settings
-from agent_revamp.embeddings import OpenAIEmbeddingService
-from agent_revamp.mcp_tools import tools_to_openai_schema
+from agent_revamp.preprocess.embeddings import OpenAIEmbeddingService
+from agent_revamp.preprocess.tool_sanitizer import sanitize_tool_schema
 
 _DEFAULT_SKILLS_DIRS: dict[str, str] = {
     "penny": "../realbooks-agents/agents/penny/skills",

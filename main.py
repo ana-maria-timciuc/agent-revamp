@@ -2,7 +2,7 @@ import argparse
 import asyncio
 
 from agent_revamp.agent import Agent
-from agent_revamp.pipeline import PreprocessPipeline
+from agent_revamp.preprocess.pipeline import PreprocessPipeline
 from agent_revamp.config import settings
 from agent_revamp.core.state import SessionStore
 
@@ -35,6 +35,12 @@ async def main() -> None:
     group.add_argument("--new", action="store_true", help="start a new session")
     group.add_argument("--list", action="store_true", help="list saved sessions and exit")
     group.add_argument("--delete", metavar="ID", help="delete a session and its cached history, then exit")
+    group.add_argument(
+        "--preprocess",
+        metavar="MESSAGE",
+        help="run intent classification + RAG + reranking on MESSAGE and print the result, "
+        "without calling the agent",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -43,6 +49,10 @@ async def main() -> None:
 
     if args.delete:
         _delete_session(args.delete)
+        return
+
+    if args.preprocess:
+        await pipeline_demo(args.preprocess)
         return
 
     store = SessionStore(settings.state_dir)
@@ -76,6 +86,9 @@ async def main() -> None:
 
 
 async def pipeline_demo(message: str) -> None:
+    """Debug entrypoint for the Preprocess box (intent classifier -> RAG -> reranker).
+    Never touches Agent/the chat-completion loop — only the classifier's own single
+    OpenAI call and Qdrant retrieval happen here."""
     pipeline = PreprocessPipeline()
     try:
         package = await pipeline.run(message)
@@ -83,10 +96,10 @@ async def pipeline_demo(message: str) -> None:
             f"intent : {package.intent.intent} (confidence={package.intent.confidence:.2f})"
         )
         print(f"raw    : {package.raw_query}")
-        print("\nskills:")
+        print(f"\nskills (reranker {'passed' if package.skills_passed else 'FAILED — best effort'}):")
         for skill in package.skills:
             print(f"  - {skill.name} ({skill.agent})")
-        print("\ntools:")
+        print(f"\ntools (reranker {'passed' if package.tools_passed else 'FAILED — best effort'}):")
         for tool in package.tools:
             print(f"  - {tool.name} ({tool.agent})")
     finally:
