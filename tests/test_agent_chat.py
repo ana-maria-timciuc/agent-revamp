@@ -1,0 +1,171 @@
+"""Unit tests for Agent.chat()'s preprocessing integration: the three-way tool-candidate
+fallback and intent/skills prompt injection added when agent.py was rewired onto
+PreprocessPipeline. No live MCP/Qdrant/OpenAI needed -- the OpenAI client is monkeypatched
+at the module-level singleton agent.py uses (_get_openai()/_openai_client).
+"""
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import agent_revamp.agent as agent_module
+from agent_revamp.agent import Agent
+from agent_revamp.preprocess.catalog import CatalogEntry, KIND_SKILL, KIND_TOOL
+from agent_revamp.preprocess.intent import IntentResult
+from agent_revamp.preprocess.pipeline import ContextPackage
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _make_agent():
+    agent = Agent(process_class="penny")
+    agent._tool_schemas = {
+        "execute_query": {"type": "function", "function": {"name": "execute_query", "parameters": {}}},
+        "generate_report": {"type": "function", "function": {"name": "generate_report", "parameters": {}}},
+    }
+    agent._openai_tools = list(agent._tool_schemas.values())
+    return agent
+
+
+def _fake_openai_client(captured_kwargs):
+    async def create(**kwargs):
+        captured_kwargs.append(kwargs)
+        message = SimpleNamespace(content="final answer", tool_calls=None)
+        message.model_dump = lambda exclude_none=True: {"role": "assistant", "content": "final answer"}
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=SimpleNamespace(total_tokens=10))
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _install_fake_openai(monkeypatch, captured_kwargs):
+    monkeypatch.setattr(agent_module, "_openai_client", _fake_openai_client(captured_kwargs))
+
+
+class _FakePipeline:
+    def __init__(self, package_factory):
+        self._package_factory = package_factory
+
+    async def run(self, msg):
+        return self._package_factory(msg)
+
+
+def test_no_pipeline_falls_back_to_the_full_tool_set(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = None
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    reply = _run(agent.chat("hello"))
+
+    assert reply == "final answer"
+    tool_names = {t["function"]["name"] for t in captured[0]["tools"]}
+    assert tool_names == {"execute_query", "generate_report"}
+    messages = captured[0]["messages"]
+    assert not any("Detected intent" in m.get("content", "") for m in messages if m["role"] == "system")
+
+
+def test_zero_retrieved_tool_candidates_falls_back_to_full_set(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = _FakePipeline(
+        lambda msg: ContextPackage(
+            intent=IntentResult(intent="lookup", confidence=0.9, raw_label="{}"), skills=[], tools=[], raw_query=msg
+        )
+    )
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    _run(agent.chat("hello"))
+
+    tool_names = {t["function"]["name"] for t in captured[0]["tools"]}
+    assert tool_names == {"execute_query", "generate_report"}
+
+
+def test_out_of_scope_candidate_yields_empty_list_never_full_access(monkeypatch):
+    """The security-critical case: a retrieved tool name that isn't in this process
+    class's allowlist (e.g. a stale hit from another process class sharing the Qdrant
+    collection) must produce an EMPTY tool list, never silently upgrade to full access."""
+    agent = _make_agent()
+
+    def make_package(msg):
+        bogus = CatalogEntry(id="stage_rows", kind=KIND_TOOL, name="stage_rows", content="x", agent="transaction_saving")
+        return ContextPackage(
+            intent=IntentResult(intent="lookup", confidence=0.9, raw_label="{}"), skills=[], tools=[bogus], raw_query=msg
+        )
+
+    agent._pipeline = _FakePipeline(make_package)
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    _run(agent.chat("hello"))
+
+    assert "tools" not in captured[0], "an empty tool list must omit the tools= kwarg entirely (matches `if tools:`)"
+
+
+def test_intent_and_skills_are_surfaced_as_system_messages(monkeypatch):
+    agent = _make_agent()
+
+    def make_package(msg):
+        skill = CatalogEntry(id="reporting", kind=KIND_SKILL, name="reporting", content="Prefer generate_report for charts.", agent="penny")
+        return ContextPackage(
+            intent=IntentResult(intent="reporting", confidence=0.87, raw_label="{}"), skills=[skill], tools=[], raw_query=msg
+        )
+
+    agent._pipeline = _FakePipeline(make_package)
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    _run(agent.chat("show me my income report"))
+
+    messages = captured[0]["messages"]
+    intent_msgs = [m for m in messages if m["role"] == "system" and "Detected intent: reporting" in m["content"]]
+    skill_msgs = [m for m in messages if m["role"] == "system" and "Prefer generate_report" in m["content"]]
+    assert len(intent_msgs) == 1
+    assert "confidence=0.87" in intent_msgs[0]["content"]
+    assert len(skill_msgs) == 1
+
+
+def test_dispatch_redacts_a_raw_db_error_before_it_enters_the_model_or_persisted_history():
+    """Regression test for the confirmed leak: sanitize_tool_result's allow-list for
+    "list"-type tools (execute_query) doesn't touch an unexpected top-level key like
+    "error", so a raw DB/driver error carrying real schema identifiers used to pass
+    through untouched. _dispatch() now also runs redact_real_schema_leaks() on every
+    tool result, regardless of tool type."""
+    agent = _make_agent()
+
+    class _FakeMCP:
+        async def call_tool(self, name, arguments):
+            assert arguments["sql"] == "SELECT 1"
+            return json.dumps(
+                {"error": "Unknown column 'flow_type' in 'field list' on table `transaction`.account_id=45"}
+            )
+
+    agent._mcp = _FakeMCP()
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="execute_query", arguments=json.dumps({"sql": "SELECT 1"})),
+    )
+
+    _, content = _run(agent._dispatch(tool_call))
+
+    assert "flow_type" not in content
+    assert "account_id" not in content
+    parsed = json.loads(content)
+    assert "Type" in parsed["error"]  # substituted with the friendly name, not just blanked
+
+
+def test_low_confidence_intent_is_not_surfaced_in_the_prompt(monkeypatch):
+    agent = _make_agent()
+    agent._pipeline = _FakePipeline(
+        lambda msg: ContextPackage(
+            intent=IntentResult(intent="off_domain", confidence=0.3, raw_label="{}"), skills=[], tools=[], raw_query=msg
+        )
+    )
+    captured = []
+    _install_fake_openai(monkeypatch, captured)
+
+    _run(agent.chat("hello"))
+
+    messages = captured[0]["messages"]
+    assert not any("Detected intent" in m.get("content", "") for m in messages if m["role"] == "system")
