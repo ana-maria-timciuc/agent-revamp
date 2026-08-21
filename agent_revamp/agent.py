@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 
 from agent_revamp.config import settings
 from agent_revamp.core.mcp_tools import call_tool_safe
-from agent_revamp.postprocess.leak_guard import sanitize_user_text
+from agent_revamp.postprocess.leak_guard import redact_real_schema_leaks, sanitize_user_text
 from agent_revamp.preprocess.process_class import ProcessClass, ToolScopeError, filter_tools, validate_tool_scope
 from agent_revamp.postprocess.result_sanitizer import sanitize_tool_result
 from agent_revamp.preprocess.schema_mapper import build_schema_prompt
@@ -479,6 +479,13 @@ class Agent:
 
         content = await call_tool_safe(self._mcp, name, args)
         content = sanitize_tool_result(content, name)
+        # Defense-in-depth: sanitize_tool_result's per-tool-type allow-lists don't cover
+        # every shape a result can take (e.g. a raw DB error surfacing from a "list"-type
+        # tool like execute_query bypasses its allow-list entirely — see leak_guard.py's
+        # module docstring). This is the same universal method that protects the
+        # assistant's own replies, applied here before the content ever enters the
+        # model's context or gets persisted to session history.
+        content = redact_real_schema_leaks(content)
         if name == "generate_report":
             self.last_report_payload = _extract_report_payload(content, raw_args.get("title"))
         return tool_call.id, content

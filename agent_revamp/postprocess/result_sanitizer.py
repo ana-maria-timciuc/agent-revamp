@@ -19,10 +19,9 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any
 
-_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
+from agent_revamp.preprocess.schema_mapper import load_schema_map, real_to_friendly_map
 
 # Unwraps function-wrapped result keys like "SUM(amount)" so the inner real column name can
 # be renamed ("SUM(Amount)").
@@ -46,11 +45,6 @@ def _sanitize_string(value: str) -> str:
     return cleaned
 
 
-def _load_map() -> dict[str, Any]:
-    with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
 def _build_reverse_column_map(tool_config: dict | None) -> dict[str, str] | None:
     if not tool_config or not tool_config.get("column_map"):
         return None
@@ -58,7 +52,7 @@ def _build_reverse_column_map(tool_config: dict | None) -> dict[str, str] | None
 
 
 def _build_hidden_set() -> set[str]:
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     hidden: set[str] = set()
     for tdef in schema_map.get("tables", {}).values():
         for h in tdef.get("hidden_columns", []):
@@ -67,28 +61,17 @@ def _build_hidden_set() -> set[str]:
 
 
 def _build_backstop_map() -> dict[str, str]:
-    """Global real → friendly map from the schema tables (lower-cased keys).
+    """Global real -> friendly map for renaming unmapped JSON result keys.
 
-    A real column that maps to different friendly names across tables is dropped: it can't
-    be disambiguated from a result key alone, and the SQL translator already re-aliases those
-    columns to the right friendly name in the SELECT list.
+    Delegates to schema_mapper.real_to_friendly_map() — the single source of truth for
+    this ambiguity-aware real->friendly substitution, also used by
+    postprocess/leak_guard.py — rather than keeping a second, independently-drifting
+    copy of the same disambiguation logic. That map also carries table real_name ->
+    friendly_table entries (irrelevant here: result keys are always column names, never
+    bare table names, so they're simply never looked up) alongside the column entries
+    this function actually needs.
     """
-    schema_map = _load_map()
-    mapping: dict[str, str] = {}
-
-    def _add(real: str, friendly: str) -> None:
-        key = real.lower()
-        existing = mapping.get(key)
-        if existing is None:
-            mapping[key] = friendly
-        elif existing != friendly:
-            mapping.pop(key, None)
-
-    for tdef in schema_map.get("tables", {}).values():
-        for fcol, rcol in tdef.get("columns", {}).items():
-            _add(rcol, fcol)
-        _add(tdef.get("pk_real", "uid"), tdef.get("pk_column", "Id"))
-    return mapping
+    return real_to_friendly_map()
 
 
 def _rename_key(key: str, backstop: dict[str, str]) -> str:
@@ -134,7 +117,7 @@ def sanitize_tool_result(content: str, tool_name: str) -> str:
     except (json.JSONDecodeError, TypeError):
         return content
 
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     tool_config = schema_map.get("result_tools", {}).get(tool_name)
     column_map = _build_reverse_column_map(tool_config)
     hidden = _build_hidden_set()

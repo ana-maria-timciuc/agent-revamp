@@ -14,18 +14,10 @@ verified session; here via a single pinned config value since there's no auth la
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 from agent_revamp.config import settings
-
-_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
-
-
-def _load_map() -> dict[str, Any]:
-    with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
+from agent_revamp.preprocess.schema_mapper import load_schema_map
 
 
 def _build_arg_maps(
@@ -47,7 +39,7 @@ def _build_arg_maps(
 
 def _forward_map(tool_name: str) -> dict[str, str]:
     """real param name → friendly name (lower-cased keys)."""
-    default, per_tool, _ = _build_arg_maps(_load_map())
+    default, per_tool, _ = _build_arg_maps(load_schema_map())
     forward = dict(default)
     forward.update(per_tool.get(tool_name, {}))
     return forward
@@ -59,7 +51,7 @@ def _reverse_map(tool_name: str) -> dict[str, str]:
 
 
 def _hidden_args(tool_name: str) -> set[str]:
-    return _build_arg_maps(_load_map())[2].get(tool_name, set())
+    return _build_arg_maps(load_schema_map())[2].get(tool_name, set())
 
 
 def sanitize_tool_schema(tool: Any) -> dict[str, Any]:
@@ -68,7 +60,7 @@ def sanitize_tool_schema(tool: Any) -> dict[str, Any]:
     Renames parameter keys, drops hidden parameters (e.g. account_id), and replaces the
     description with the friendly rewrite from schema_map.json (falling back to the original).
     """
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     forward = _forward_map(tool.name)
     hidden = _hidden_args(tool.name)
     description = schema_map.get("tool_description_rewrites", {}).get(tool.name, tool.description or "")

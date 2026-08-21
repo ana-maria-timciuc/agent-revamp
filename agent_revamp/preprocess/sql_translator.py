@@ -13,28 +13,21 @@ guard requires the exact backtick-quoted form and unquoted output would be rejec
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
 from typing import Any
 
 import sqlglot
 from sqlglot import exp
 
-logger = logging.getLogger(__name__)
+from agent_revamp.preprocess.schema_mapper import load_schema_map
 
-_SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
+logger = logging.getLogger(__name__)
 
 
 class SQLTranslationError(Exception):
     """Raised when the model's SQL can't be safely translated to the real schema —
     unparseable, not a SELECT, or referencing a table/column outside the data catalog.
     Callers must treat this as a rejected query, never fall back to the untranslated SQL."""
-
-
-def _load_map() -> dict[str, Any]:
-    with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
 
 
 def _build_lookups(schema_map: dict[str, Any]) -> dict[str, Any]:
@@ -81,6 +74,7 @@ def _translate_table(
     lookups: dict[str, Any],
     referenced: set[str],
     alias_map: dict[str, str],
+    alias_scopes: dict[str, exp.Select],
     unresolved: set[str],
 ) -> None:
     if not _token_is_identifier(node.this):
@@ -100,7 +94,15 @@ def _translate_table(
     node.set("this", exp.Identifier(this=real_name, quoted=bool(config.get("backtick"))))
 
     alias = node.alias_or_name
-    alias_map[alias.lower()] = config.get("_orig_friendly", friendly)
+    alias_key = alias.lower()
+    alias_map[alias_key] = config.get("_orig_friendly", friendly)
+    # The nearest enclosing SELECT this table actually belongs to — a top-level table's
+    # scope is the top-level query itself; a table inside a subquery's scope is that
+    # subquery's own inner SELECT. Mandatory WHERE clauses must attach here, not always
+    # to the outermost query (see _add_mandatory_where).
+    scope = node.find_ancestor(exp.Select)
+    if scope is not None:
+        alias_scopes[alias_key] = scope
     referenced.add(config.get("_orig_friendly", friendly))
 
 
@@ -206,6 +208,7 @@ def _add_mandatory_where(
     tree: exp.Expression,
     lookups: dict[str, Any],
     alias_map: dict[str, str],
+    alias_scopes: dict[str, exp.Select],
     account_id: int,
 ) -> None:
     configs = lookups["friendly_table_config"]
@@ -214,11 +217,16 @@ def _add_mandatory_where(
         config = configs.get(friendly_name)
         if not config:
             continue
+        # Attach to the table's own enclosing SELECT, not always the outermost query —
+        # a table nested inside a subquery is only in scope there; falling back to
+        # `tree` mirrors the previous (pre-fix) behavior for the untracked-scope case,
+        # which should not occur in practice since _translate_table always records one.
+        scope = alias_scopes.get(alias, tree)
         for clause in config.get("mandatory_where", []):
             filled = clause.replace("{alias}", alias).replace("{account_id}", str(account_id))
             try:
                 parsed = sqlglot.parse_one(filled, dialect="mysql")
-                tree = tree.where(parsed, copy=False)
+                scope.where(parsed, copy=False)
             except Exception:
                 logger.debug("Failed to parse mandatory where clause: %s", filled)
 
@@ -227,7 +235,7 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
     if not friendly_sql or not friendly_sql.strip():
         return friendly_sql
 
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     lookups = _build_lookups(schema_map)
 
     friendly_sql = friendly_sql.replace("{account_id}", str(account_id))
@@ -241,6 +249,7 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
         raise SQLTranslationError("Only SELECT queries are allowed.")
 
     alias_map: dict[str, str] = {}
+    alias_scopes: dict[str, exp.Select] = {}
     referenced_tables: set[str] = set()
     unresolved: set[str] = set()
 
@@ -259,7 +268,7 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
     derived_aliases = frozenset(sq.alias.lower() for sq in tree.find_all(exp.Subquery) if sq.alias)
 
     for table_node in tree.find_all(exp.Table):
-        _translate_table(table_node, lookups, referenced_tables, alias_map, unresolved)
+        _translate_table(table_node, lookups, referenced_tables, alias_map, alias_scopes, unresolved)
 
     for col_node in tree.find_all(exp.Column):
         _translate_column(col_node, lookups, alias_map, unresolved, select_aliases, derived_aliases)
@@ -271,6 +280,6 @@ def translate_sql(friendly_sql: str, account_id: int) -> str:
         )
 
     _alias_selected_columns(tree)
-    _add_mandatory_where(tree, lookups, alias_map, account_id)
+    _add_mandatory_where(tree, lookups, alias_map, alias_scopes, account_id)
 
     return tree.sql(dialect="mysql", pretty=False)

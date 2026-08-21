@@ -1,11 +1,28 @@
-"""Final-answer leak guard: strips internal machinery (SQL, schema identifiers, tax IDs)
-from the model's natural-language reply before it reaches the user or gets persisted.
+"""Leak guard: strips internal machinery (SQL, schema identifiers, tax IDs) from any text
+that might reach the model or the user.
 
 Ported from realbooks-agents/app/agent/harness.py's `_sanitize_user_text` (the regex pipeline
 below is unchanged in approach). This is the last line of defense — everything upstream
 (tool_sanitizer, sql_translator, result_sanitizer) is meant to keep the model from ever
 learning real schema in the first place; this catches whatever slips through anyway (a
-hallucinated real name, a recited friendly label, a pasted SQL fragment).
+hallucinated real name, a recited friendly label, a pasted SQL fragment, a raw DB error
+string that made it past result_sanitizer.py's allow-list).
+
+Two entry points, one shared core:
+- `redact_real_schema_leaks()` — the universal method: strips/substitutes real schema
+  identifiers, raw SQL, tax IDs, and known internal product names. Safe to apply to
+  ANY text, including JSON tool-result content, since it never touches friendly
+  (PascalCase) catalog labels or generic "schema"/"database" language — those steps are
+  prose-specific and would corrupt a JSON key's exact spelling (e.g. turning the key
+  `"PropertyName"` into `"Property Name"`) if applied to structured tool output.
+  Called from `agent.py::Agent._dispatch()` right after `sanitize_tool_result()`, as
+  defense-in-depth against any leak path result_sanitizer.py's per-tool-type allow-lists
+  don't cover (its own docstring flags exactly this gap for `"list"`-type tools, e.g. a
+  raw DB error surfacing from `execute_query`).
+- `sanitize_user_text()` — the assistant-reply-specific superset: everything
+  `redact_real_schema_leaks()` does, plus humanizing recited friendly catalog labels and
+  stripping generic schema-narration language — safe only for natural-language prose,
+  never for structured data.
 
 Not ported: harness.py's `_emit_sanitized`, a streaming-token buffer that holds partial
 output across sentence/code-fence boundaries so a multi-token leak isn't missed mid-stream.
@@ -17,7 +34,10 @@ Deviation from the reference: harness.py's real-schema-word blocklist (_SCHEMA_W
 hand-maintained and specific to its own (larger) schema. Here it's built dynamically from
 schema_map.json via schema_mapper.real_schema_words(), the same "derived from the catalog,
 not hand-maintained" approach the reference already uses for schema_dot_notation_words() —
-so it stays correct for this project's actual (different, smaller) schema automatically.
+so it stays correct for this project's actual (different, smaller) schema automatically. A
+caught real name is substituted with its friendly equivalent (schema_mapper.real_to_friendly_map())
+rather than opaquely redacted, wherever one exists — names with no friendly form at all
+(hidden columns like account_id, delete_timestamp) still fall back to redaction.
 
 One narrow exception: _INTERNAL_PRODUCT_NAMES_RE below is a small, explicitly
 hand-maintained supplement for internal implementation/product names (e.g. "MariaDB")
@@ -34,6 +54,7 @@ import re
 from agent_revamp.preprocess.schema_mapper import (
     friendly_identifier_words,
     real_schema_words,
+    real_to_friendly_map,
     schema_dot_notation_words,
 )
 
@@ -77,6 +98,15 @@ _SCHEMA_WORDS_RE = re.compile(
     r"\b(?:" + "|".join(sorted((re.escape(w) for w in real_schema_words()), reverse=True)) + r")\b",
     re.I,
 )
+
+# Real -> friendly substitution table (see schema_mapper.real_to_friendly_map()). A match
+# with no entry here (a hidden column with no friendly form at all, e.g. account_id) falls
+# back to full redaction — there's nothing safe to reveal instead.
+_REAL_TO_FRIENDLY = real_to_friendly_map()
+
+
+def _replace_real_name(match: re.Match) -> str:
+    return _REAL_TO_FRIENDLY.get(match.group(0).lower(), _REDACTED)
 
 # Hand-maintained supplement for internal implementation/product names that can never be
 # derived from schema_map.json (it's not a column/table identifier at all) but must never
@@ -125,15 +155,21 @@ _SCHEMA_META_RE = re.compile(
 _PK_LINE_RE = re.compile(r"^[ \t]*[A-Z][A-Za-z0-9]+: Id[ \t]*$", re.M)
 
 
-def sanitize_user_text(text: str) -> str:
-    """Strip internal machinery (code, SQL, schema identifiers) from user-facing text.
+def redact_real_schema_leaks(text: str) -> str:
+    """Strip/substitute any real (non-friendly) schema identifiers, raw SQL, tax IDs, or
+    known internal product names from `text` — the one method used everywhere a leak
+    might otherwise reach the model or the user, regardless of source (an assistant
+    reply, or raw tool-result content). A caught real name is replaced with its friendly
+    equivalent where one exists (schema_mapper.real_to_friendly_map()), so the text stays
+    informative ("Unknown column 'Type'" rather than "Unknown column '[details
+    omitted]'"); names with no friendly form at all (hidden columns like account_id,
+    delete_timestamp) fall back to full redaction — there's nothing safe to reveal
+    instead.
 
-    Order matters: whole fenced blocks first, then full SQL statements, then narrower
-    table.column and bare-identifier references. Recited friendly catalog labels
-    (PropertyName, LoanNumber, ...) are expanded to plain words rather than dropped — the
-    PascalCase format is internal, not the meaning (bare "Id" is still redacted). Generic
-    schema-description language ("primary table", "key columns", bare "schema"/"database")
-    is stripped outright. Money and normal prose pass through untouched.
+    Deliberately does NOT touch friendly (PascalCase) catalog labels or generic
+    "schema"/"database" narration — see sanitize_user_text() for those, and the module
+    docstring for why this function must stay safe to run on structured JSON content
+    (those prose-only steps would corrupt a JSON key's exact spelling).
     """
     if not text:
         return text
@@ -142,10 +178,29 @@ def sanitize_user_text(text: str) -> str:
         lambda m: _REDACTED if ("`" in m.group(0) or _SQL_KW_RE.search(m.group(0))) else m.group(0), out
     )
     out = _TABLE_COL_RE.sub(_REDACTED, out)
-    out = _SCHEMA_WORDS_RE.sub(_REDACTED, out)
+    out = _SCHEMA_WORDS_RE.sub(_replace_real_name, out)
     out = _INTERNAL_PRODUCT_NAMES_RE.sub(_REDACTED, out)
+    out = _TAX_ID_RE.sub(_REDACTED, out)
+    return out
+
+
+def sanitize_user_text(text: str) -> str:
+    """Strip internal machinery (code, SQL, schema identifiers) from user-facing text —
+    everything redact_real_schema_leaks() does, plus prose-only steps that are unsafe to
+    apply to structured data.
+
+    Order matters: whole fenced blocks first, then full SQL statements, then narrower
+    table.column and bare-identifier references (all via redact_real_schema_leaks()),
+    then recited friendly catalog labels (PropertyName, LoanNumber, ...), expanded to
+    plain words rather than dropped — the PascalCase format is internal, not the meaning
+    (bare "Id" is still redacted). Generic schema-description language ("primary table",
+    "key columns", bare "schema"/"database") is stripped outright. Money and normal prose
+    pass through untouched.
+    """
+    if not text:
+        return text
+    out = redact_real_schema_leaks(text)
     out = _FRIENDLY_SCHEMA_WORDS_RE.sub(lambda m: _FRIENDLY_HUMAN.get(m.group(0), _REDACTED), out)
     out = _PK_LINE_RE.sub(_REDACTED, out)
     out = _SCHEMA_META_RE.sub(_REDACTED, out)
-    out = _TAX_ID_RE.sub(_REDACTED, out)
     return out

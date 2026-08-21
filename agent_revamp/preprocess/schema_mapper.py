@@ -18,7 +18,11 @@ from typing import Any
 _SCHEMA_MAP_PATH = Path(__file__).parent.parent / "schema_map.json"
 
 
-def _load_map() -> dict[str, Any]:
+def load_schema_map() -> dict[str, Any]:
+    """Load schema_map.json fresh (no caching — reflects edits immediately). The single
+    canonical loader; preprocess/sql_translator.py, preprocess/tool_sanitizer.py, and
+    postprocess/result_sanitizer.py all import this rather than each keeping their own
+    copy of the same two-line file read."""
     with open(_SCHEMA_MAP_PATH, encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -78,7 +82,7 @@ def _column_hint(friendly_name: str, table: str) -> str:
 
 def build_friendly_schema() -> dict[str, Any]:
     """Produce a dict describing available data in business terms — friendly names only."""
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     tables = schema_map.get("tables", {})
     joins = schema_map.get("joins", {})
     rules = schema_map.get("sql_rules", {})
@@ -139,7 +143,7 @@ def friendly_identifier_words() -> set[str]:
     user-facing text. The data catalog is for the LLM's own SQL-writing — even the safe,
     business-language names are internal labels, not something to recite back to the user.
     """
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     words: set[str] = set()
     for friendly_name, tdef in schema_map.get("tables", {}).items():
         words.add(friendly_name)
@@ -158,7 +162,7 @@ def schema_dot_notation_words() -> set[str]:
     bare single-word real names (name, vendor, date) would collide with prose and email
     local parts ("first.name@example.com").
     """
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     words: set[str] = set()
     for table, tdef in schema_map.get("tables", {}).items():
         words.add(table)
@@ -180,7 +184,7 @@ def real_schema_words() -> set[str]:
     _GENERIC_REAL_WORDS so normal conversation is never mangled; the friendly names for those
     same concepts are handled separately by friendly_identifier_words().
     """
-    schema_map = _load_map()
+    schema_map = load_schema_map()
     words: set[str] = set()
     for tdef in schema_map.get("tables", {}).values():
         candidates = {tdef.get("real_name", ""), tdef.get("pk_real", "")}
@@ -190,6 +194,41 @@ def real_schema_words() -> set[str]:
             w for w in candidates if w and w.lower() not in _GENERIC_REAL_WORDS and ("_" in w or w == "uid")
         )
     return words
+
+
+def real_to_friendly_map() -> dict[str, str]:
+    """Real (lowercased) identifier -> friendly identifier, for substituting a leaked real
+    name with its safe equivalent instead of opaquely redacting it — used by
+    postprocess/leak_guard.py's redact_real_schema_leaks() so a caught leak stays
+    informative ("Type" instead of "[details omitted]") wherever a friendly name exists.
+
+    A real name that means different friendly things in different tables (e.g. "name" is
+    both Entities.EntityName and CategoryLookup.CategoryName) can't be safely substituted
+    from the bare word alone, so ambiguous entries are dropped entirely — same
+    disambiguation rule postprocess/result_sanitizer.py's backstop map already uses.
+    Real names with no friendly form at all (hidden columns like account_id,
+    delete_timestamp, split_transactions_id) are simply absent — callers must fall back to
+    redaction for those, since there's nothing safe to reveal instead.
+    """
+    schema_map = load_schema_map()
+    mapping: dict[str, str] = {}
+
+    def _add(real: str, friendly: str) -> None:
+        if not real:
+            return
+        key = real.lower()
+        existing = mapping.get(key)
+        if existing is None:
+            mapping[key] = friendly
+        elif existing != friendly:
+            mapping.pop(key, None)
+
+    for friendly_table, tdef in schema_map.get("tables", {}).items():
+        _add(tdef.get("real_name", ""), friendly_table)
+        _add(tdef.get("pk_real", "uid"), tdef.get("pk_column", "Id"))
+        for fcol, rcol in tdef.get("columns", {}).items():
+            _add(rcol, fcol)
+    return mapping
 
 
 def build_schema_prompt() -> str:
