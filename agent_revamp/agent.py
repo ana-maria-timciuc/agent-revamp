@@ -194,27 +194,35 @@ class Agent:
         self._tool_schemas = {t["function"]["name"]: t for t in self._openai_tools}
 
         # Dynamic skills & tools: index MCP tools and markdown skills into Qdrant so each
-        # turn can retrieve only what is relevant. If Qdrant is down or indexing fails,
-        # the agent degrades gracefully: all tools stay available, no skill context.
+        # turn can retrieve only what is relevant (preprocess/pipeline.py, the diagram's
+        # Preprocess box: intent classifier -> RAG -> reranker). If Qdrant is down or
+        # indexing fails, the agent degrades gracefully: all tools stay available, no
+        # skill context, no intent surfaced.
         try:
-            embedder = Embedder(_get_openai())
-            self._tool_index = ToolIndex(embedder=embedder)
-            await self._tool_index.__aenter__()
-            if not await self._tool_index.index_tools(mcp_tools):
-                await self._tool_index.__aexit__(None, None, None)
-                self._tool_index = None
+            catalog = QdrantCatalog(embedder=OpenAIEmbeddingService())
+            tool_entries = [
+                CatalogEntry(
+                    id=t.name, kind=KIND_TOOL, name=t.name,
+                    content=f"{t.name}\n{t.description or ''}", agent=self.process_class,
+                )
+                for t in mcp_tools
+            ]
+            if not await catalog.upsert(tool_entries):
+                await catalog.close()
+                self._pipeline = None
             else:
-                skill_texts = self._load_skills()
-                if skill_texts:
-                    self._skill_index = SkillIndex(embedder=embedder)
-                    await self._skill_index.__aenter__()
-                    if not await self._skill_index.index_skills(skill_texts):
-                        await self._skill_index.__aexit__(None, None, None)
-                        self._skill_index = None
+                skill_entries = [
+                    CatalogEntry(id=name, kind=KIND_SKILL, name=name, content=text, agent=self.process_class)
+                    for name, text in self._load_skills()
+                ]
+                if skill_entries and not await catalog.upsert(skill_entries):
+                    logger.warning("Skill indexing failed; continuing with tool retrieval only")
+                self._pipeline = PreprocessPipeline(
+                    classifier=LLMIntentClassifier(client=_get_openai()), catalog=catalog
+                )
         except Exception as exc:
             logger.warning("Qdrant init failed, continuing without vector index: %s", exc)
-            self._tool_index = None
-            self._skill_index = None
+            self._pipeline = None
 
         # The model never sees penny-mcp's real db://schema resource (real table/column
         # names) — it gets the friendly-only catalog built from preprocess/schema_map.json
@@ -227,10 +235,8 @@ class Agent:
     async def __aexit__(self, *exc_info) -> None:
         if self._mcp is not None:
             await self._mcp.__aexit__(*exc_info)
-        if self._tool_index is not None:
-            await self._tool_index.__aexit__(None, None, None)
-        if self._skill_index is not None:
-            await self._skill_index.__aexit__(None, None, None)
+        if self._pipeline is not None:
+            await self._pipeline.close()
         self._persist()
 
     @staticmethod
@@ -278,20 +284,13 @@ class Agent:
         messages.extend(self.messages[turn_start_idx:])
         return messages
 
-    async def _retrieve_tools(self, query: str) -> list[dict] | None:
-        """Relevant tool schemas for the query, from Qdrant. None = fall back to all tools."""
-        if self._tool_index is None:
+    async def _run_preprocessing(self, user_message: str) -> ContextPackage | None:
+        """Run the Preprocess box (intent classifier -> RAG -> reranker) once per turn.
+        None = no pipeline available (Qdrant/indexing failed in __aenter__) -> caller
+        falls back to the full tool set, no skills, no intent."""
+        if self._pipeline is None:
             return None
-        hits = await self._tool_index.search_tools(query)
-        if not hits:
-            return None
-        return [self._tool_schemas[h["tool_name"]] for h in hits if h["tool_name"] in self._tool_schemas]
-
-    async def _retrieve_skills(self, query: str) -> list[str]:
-        if self._skill_index is None:
-            return []
-        chunks = await self._skill_index.search_skills(query)
-        return chunks or []
+        return await self._pipeline.run(user_message)
 
     async def chat(self, user_message: str, event_sink: Callable[[dict], Awaitable[None]] | None = None) -> str:
         """Single conversational turn — runs the bounded tool-call loop internally and
@@ -306,12 +305,33 @@ class Agent:
         self.messages.append({"role": "user", "content": user_message})
         client = _get_openai()
 
-        tools = await self._retrieve_tools(user_message)
-        skills = await self._retrieve_skills(user_message)
-        if tools is None:
+        package = await self._run_preprocessing(user_message)
+
+        # Three-way tool-candidate fallback: no pipeline, or the pipeline retrieved zero
+        # tool candidates -> fall back to the full (process-class-filtered) tool set.
+        # Retrieved candidates that don't survive the self._tool_schemas membership check
+        # below yield an *empty* list, deliberately NOT the full set — a name outside the
+        # process-class allowlist must never silently upgrade to "full access."
+        if package is None or not package.tools:
             tools = self._openai_tools
+        else:
+            tools = [self._tool_schemas[e.name] for e in package.tools if e.name in self._tool_schemas]
+
+        skills = [e.content for e in package.skills] if package else []
         if skills:
             logger.info("Retrieved %d skill(s) for the turn", len(skills))
+
+        # Fold the classified intent + retrieved skills into the prompt (as separate
+        # system-role messages, same mechanism _history_for_llm already uses for skills).
+        # Intent is gated on is_confident (>= 0.6) so a low-confidence guess never
+        # pollutes the prompt.
+        extra_system: list[str] = []
+        if package is not None and package.intent.is_confident:
+            extra_system.append(
+                f"--- Detected intent: {package.intent.intent} (confidence={package.intent.confidence:.2f}) ---"
+            )
+        if skills:
+            extra_system.append("--- Relevant skills for this request ---\n" + "\n\n".join(skills))
 
         # Second, independent check (filter_tools in __aenter__ is the first): assert every
         # tool about to be shown to the model this turn is within this process class's
@@ -328,10 +348,7 @@ class Agent:
         for _ in range(self.max_iterations):
             kwargs: dict = {
                 "model": self.model,
-                "messages": self._history_for_llm(
-                    turn_start_idx,
-                    extra_system=["--- Relevant skills for this request ---\n" + "\n\n".join(skills)] if skills else None,
-                ),
+                "messages": self._history_for_llm(turn_start_idx, extra_system=extra_system or None),
             }
             if tools:
                 kwargs.update(tools=tools, tool_choice="auto", parallel_tool_calls=True)

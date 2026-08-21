@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     embedding_model: str = Field(
         default="text-embedding-3-small", alias="EMBEDDING_MODEL"
     )
+    rerank_max_retries: int = Field(default=2, alias="RERANK_MAX_RETRIES")
+    rerank_retry_top_k_multiplier: int = Field(default=2, alias="RERANK_RETRY_TOP_K_MULTIPLIER")
 
     default_account_id: int = Field(default=1, alias="DEFAULT_ACCOUNT_ID")
     process_class: ProcessClass = Field(default="penny", alias="PROCESS_CLASS")
@@ -34,26 +36,19 @@ class Settings(BaseSettings):
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
     qdrant_tools_collection: str = Field(default="agent_tools", alias="QDRANT_TOOLS_COLLECTION")
     qdrant_skills_collection: str = Field(default="agent_skills", alias="QDRANT_SKILLS_COLLECTION")
-    qdrant_embedding_model: str = Field(default="text-embedding-3-small", alias="QDRANT_EMBEDDING_MODEL")
     qdrant_top_k: int = Field(default=8, alias="QDRANT_TOP_K")
     skills_dir: str = Field(default="skills/", alias="SKILLS_DIR")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ── RAG / intent preprocessing ─────────────────────────────────────────
-    skills_collection: str = Field(default="skills", alias="QDRANT_SKILLS_COLLECTION")
-    tools_collection: str = Field(default="tools", alias="QDRANT_TOOLS_COLLECTION")
     intent_taxonomy: str = Field(
         default=DEFAULT_INTENT_TAXONOMY, alias="INTENT_TAXONOMY"
     )
-    retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K")
     skills_dirs: str = Field(default="", alias="SKILLS_DIRS")
     # Comma-separated agent_type=/path/to/skills pairs, e.g.
     # "penny=../realbooks-agents/agents/penny/skills,dollar_bill=../realbooks-agents/agents/dollar_bill/skills,"
     # "uncle_sam=../realbooks-agents/agents/uncle_sam/skills". Empty falls back to defaults below.
 
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
     # Auth into /agent/* (mirrors realbooks-agents): the Cognito Bearer token is verified
     # via JWKS and account_id/permissions/role_key are derived from the users SAPI — never
     # from the request body. Same env names as the original service, so the same credentials
